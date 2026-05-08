@@ -226,6 +226,50 @@ async function semanticExtract(text) {
   return await res.json();
 }
 
+async function visionExtract(imageDataUrl, { cityHint, interestHint } = {}) {
+  const res = await fetch("/api/vision", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ imageDataUrl, cityHint, interestHint })
+  });
+  if (!res.ok) throw new Error(`视觉识别接口失败：HTTP ${res.status}`);
+  return await res.json();
+}
+
+function loadImageFromFile(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      resolve(img);
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("加载图片失败"));
+    };
+    img.src = url;
+  });
+}
+
+async function fileToJpegDataUrl(file, { maxDim = 1280, quality = 0.72 } = {}) {
+  const img = await loadImageFromFile(file);
+  const w = img.naturalWidth || img.width;
+  const h = img.naturalHeight || img.height;
+  const scale = Math.min(1, maxDim / Math.max(w, h));
+  const tw = Math.max(1, Math.round(w * scale));
+  const th = Math.max(1, Math.round(h * scale));
+
+  const canvas = document.createElement("canvas");
+  canvas.width = tw;
+  canvas.height = th;
+  const ctx = canvas.getContext("2d", { alpha: false });
+  if (!ctx) throw new Error("Canvas 不可用");
+  ctx.drawImage(img, 0, 0, tw, th);
+
+  return canvas.toDataURL("image/jpeg", quality);
+}
+
 async function getSettings() {
   const stored = await kvGet("settings", null);
   return { ...DEFAULT_SETTINGS, ...(stored || {}) };
@@ -671,37 +715,31 @@ async function importFiles(files) {
     }
 
     let text = "";
+    let ai = null;
     try {
-      const ocrStartedAt = Date.now();
-      text = await ocrImage(file, {
-        lang: state.settings.ocrLang,
-        startedAt: ocrStartedAt,
-        onProgress: (p, m, startedAt) => {
-          const pct = Math.max(0, Math.min(100, Math.round(p * 100)));
-          els.progressBar.style.width = `${pct}%`;
-          const raw = typeof m?.status === "string" ? m.status : "";
-          const status = normalizeTesseractStatus(raw);
-          const elapsed = formatDuration(Date.now() - (startedAt || Date.now()));
+      // High-cost / high-quality mode: use BigModel vision to do OCR + semantic in one pass.
+      setProgress("AI 识别中", idx + 1, list.length);
+      els.progressBar.style.width = "10%";
 
-          if (!status) return;
+      const visionImage = await withTimeout(fileToJpegDataUrl(file), 60_000, "压缩图片");
+      els.progressBar.style.width = "25%";
 
-          let extra = "";
-          const slowHintAfterMs = 2 * 60_000;
-          if (Date.now() - (startedAt || Date.now()) > slowHintAfterMs) {
-            extra =
-              "\n（首次下载引擎/语言包可能较慢；若长时间无进度，可能被网络/扩展拦截，可在 F12→Network 查看请求是否超时/被拦）";
-          } else if (status.includes("下载/加载语言包") || status.includes("加载 OCR 引擎")) {
-            extra = "\n（首次使用需要下载资源，耐心等一下）";
-          }
+      ai = await withTimeout(
+        visionExtract(visionImage, {
+          cityHint: state.settings.currentCity && state.settings.currentCity !== "全部" ? state.settings.currentCity : "",
+          interestHint: state.activeInterest && state.activeInterest !== "全部" ? state.activeInterest : ""
+        }),
+        180_000,
+        "AI 识别"
+      );
+      els.progressBar.style.width = "85%";
 
-          els.progressText.textContent = `${status} · 已用时 ${elapsed}（${idx + 1}/${list.length}）${extra}`;
-        }
-      });
+      text = typeof ai?.text === "string" ? ai.text : "";
     } catch (e) {
       showProgress(false);
       const msg = String(e?.message || e || "未知错误");
       alert(
-        `OCR 卡住/失败：${msg}\n\n建议排查：\n1) Edge 按 F12 → Network，看看是否有 tesseract 的 worker/wasm/语言包请求被拦截（常见：ERR_BLOCKED_BY_CLIENT / DNS / 超时）。\n2) 关闭广告拦截类扩展后重试。\n3) 若在公司/校园网，换网络或开热点再试。`
+        `AI 识别失败：${msg}\n\n建议排查：\n1) Edge 按 F12 → Network，确认 /api/vision 是否返回 200。\n2) EdgeOne Functions 是否已配置 BIGMODEL_API_KEY。\n3) 若返回 502，查看 details 里的上游错误信息。`
       );
       throw e;
     }
@@ -715,22 +753,12 @@ async function importFiles(files) {
     let address = "";
     let title = guessTitleFromText(text);
 
-    // Semantic extraction via EdgeOne function + BigModel (API key stays server-side).
-    // Fallback to local rules when unavailable.
-    try {
-      setProgress("语义理解中", idx + 1, list.length);
-      const sem = await withTimeout(semanticExtract(text), 15_000, "语义理解");
-      if (typeof sem?.title === "string" && sem.title.trim()) title = sem.title.trim();
-      if (typeof sem?.city === "string" && sem.city.trim()) city = sem.city.trim();
-      if (Array.isArray(sem?.interests) && sem.interests.length) interests = sem.interests;
-      if (typeof sem?.poi === "string") poi = sem.poi.trim();
-      if (typeof sem?.address === "string") address = sem.address.trim();
-    } catch {
-      if (state.settings.classifierMode === "rules") {
-        interests = classifyInterests(text);
-        city = detectCityFromText(text);
-      }
-    }
+    // Apply AI fields (from /api/vision)
+    if (typeof ai?.title === "string" && ai.title.trim()) title = ai.title.trim();
+    if (typeof ai?.city === "string" && ai.city.trim()) city = ai.city.trim();
+    if (Array.isArray(ai?.interests) && ai.interests.length) interests = ai.interests;
+    if (typeof ai?.poi === "string") poi = ai.poi.trim();
+    if (typeof ai?.address === "string") address = ai.address.trim();
 
     if (!interests?.length) interests = ["未分类"];
     if (!city) city = "未知";
@@ -746,6 +774,7 @@ async function importFiles(files) {
       primaryInterest,
       poi,
       address,
+      aiConfidence: typeof ai?.confidence === "number" ? ai.confidence : 0,
       source: "截图",
       imageDataUrl,
       imageHash

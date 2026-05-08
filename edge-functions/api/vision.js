@@ -1,0 +1,144 @@
+const BIGMODEL_BASE_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions";
+
+function json(data, { status = 200, headers = {} } = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
+      ...headers
+    }
+  });
+}
+
+function badRequest(message) {
+  return json({ error: message }, { status: 400 });
+}
+
+function serverError(message) {
+  return json({ error: message }, { status: 500 });
+}
+
+function safeJsonParse(s) {
+  try {
+    return JSON.parse(s);
+  } catch {
+    return null;
+  }
+}
+
+export default async function onRequest(context) {
+  const { request } = context;
+  if (request.method !== "POST") {
+    return json({ error: "Method Not Allowed" }, { status: 405, headers: { Allow: "POST" } });
+  }
+
+  const env = context?.env || {};
+  const apiKey = env.BIGMODEL_API_KEY;
+  if (!apiKey) return serverError("Missing env: BIGMODEL_API_KEY");
+
+  let body = null;
+  try {
+    body = await request.json();
+  } catch {
+    return badRequest("Invalid JSON body");
+  }
+
+  const imageDataUrl = String(body?.imageDataUrl || "").trim();
+  if (!imageDataUrl.startsWith("data:image/")) {
+    return badRequest("Missing/invalid field: imageDataUrl (data:image/*;base64,...)");
+  }
+
+  const cityHint = typeof body?.cityHint === "string" ? body.cityHint.trim() : "";
+  const interestHint = typeof body?.interestHint === "string" ? body.interestHint.trim() : "";
+
+  const model = String(env.BIGMODEL_VISION_MODEL || body?.model || "glm-5v-turbo").trim();
+
+  const system = [
+    "你是一个截图信息抽取与归类助手。",
+    "输入是一张截图图片。你需要先识别图片中的文字（OCR），再理解文字意思，并输出结构化 JSON。",
+    "必须只输出 JSON（不要 Markdown，不要解释）。",
+    "JSON 结构固定为：",
+    '{ "title": string, "city": string, "interests": string[], "poi": string, "address": string, "text": string, "confidence": number }',
+    "规则：",
+    "- text：尽量完整的 OCR 文本（可包含换行）。",
+    "- title：尽量短（<=26字），代表核心对象（店名/景点/事件）。",
+    "- city：尽量从内容判断；如果没有把握填“未知”。",
+    "- interests：从语义判断 1~3 个标签；没有把握返回 [\"未分类\"]。",
+    "- poi：店名/景点名（可为空字符串）。",
+    "- address：地址（可为空字符串）。",
+    "- confidence：0~1 的整体置信度。",
+    "你可能会得到这些提示：",
+    `- cityHint: ${cityHint || "(none)"}`,
+    `- interestHint: ${interestHint || "(none)"}`
+  ].join("\n");
+
+  const userText = [
+    "请对这张截图做 OCR，并按规则输出 JSON。",
+    "注意：只输出 JSON。"
+  ].join("\n");
+
+  const payload = {
+    model,
+    stream: false,
+    temperature: 0.2,
+    messages: [
+      { role: "system", content: system },
+      {
+        role: "user",
+        content: [
+          { type: "image_url", image_url: { url: imageDataUrl } },
+          { type: "text", text: userText }
+        ]
+      }
+    ]
+  };
+
+  let upstream = null;
+  try {
+    upstream = await fetch(BIGMODEL_BASE_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(payload)
+    });
+  } catch (e) {
+    return serverError(`Upstream fetch failed: ${String(e?.message || e)}`);
+  }
+
+  let raw = null;
+  try {
+    raw = await upstream.json();
+  } catch {
+    return serverError(`Upstream non-JSON response (status ${upstream.status})`);
+  }
+
+  if (!upstream.ok) {
+    return json({ error: "Upstream error", status: upstream.status, details: raw }, { status: 502 });
+  }
+
+  const content = raw?.choices?.[0]?.message?.content;
+  const parsed = typeof content === "string" ? safeJsonParse(content) : null;
+  if (!parsed || typeof parsed !== "object") {
+    return json({ error: "Model output is not valid JSON", model, content }, { status: 502 });
+  }
+
+  const out = {
+    title: typeof parsed.title === "string" ? parsed.title.trim().slice(0, 40) : "",
+    city: typeof parsed.city === "string" ? parsed.city.trim().slice(0, 12) : "未知",
+    interests: Array.isArray(parsed.interests)
+      ? parsed.interests.map((x) => String(x).trim()).filter(Boolean).slice(0, 5)
+      : ["未分类"],
+    poi: typeof parsed.poi === "string" ? parsed.poi.trim().slice(0, 40) : "",
+    address: typeof parsed.address === "string" ? parsed.address.trim().slice(0, 80) : "",
+    text: typeof parsed.text === "string" ? parsed.text : "",
+    confidence: typeof parsed.confidence === "number" ? Math.max(0, Math.min(1, parsed.confidence)) : 0
+  };
+  if (!out.interests.length) out.interests = ["未分类"];
+  if (!out.city) out.city = "未知";
+
+  return json(out);
+}
+
