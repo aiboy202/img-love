@@ -48,25 +48,32 @@ async function readSecret(env, key) {
 }
 
 export default async function onRequest(context) {
-  const { request } = context;
-  if (request.method !== "POST") {
-    return json({ error: "Method Not Allowed" }, { status: 405, headers: { Allow: "POST" } });
-  }
-
-  const env = context?.env || {};
-  const apiKey = await readSecret(env, "BIGMODEL_API_KEY");
-  if (!apiKey) {
-    return serverError(
-      "Missing BIGMODEL_API_KEY (set as env var, or store it in Pages KV and bind the namespace to this project)."
-    );
-  }
-
-  let body = null;
   try {
-    body = await request.json();
-  } catch {
-    return badRequest("Invalid JSON body");
-  }
+    const { request } = context;
+    if (request.method !== "POST") {
+      return json({ error: "Method Not Allowed" }, { status: 405, headers: { Allow: "POST" } });
+    }
+
+    const env = context?.env || {};
+    const kvBound = Boolean(findKv(env));
+    const apiKey = await readSecret(env, "BIGMODEL_API_KEY");
+    if (!apiKey) {
+      return json(
+        {
+          error: "Missing BIGMODEL_API_KEY",
+          hint: "Set env var BIGMODEL_API_KEY, or store it in a bound Pages KV namespace with key BIGMODEL_API_KEY.",
+          kvBound
+        },
+        { status: 500 }
+      );
+    }
+
+    let body = null;
+    try {
+      body = await request.json();
+    } catch {
+      return badRequest("Invalid JSON body");
+    }
 
   const imageDataUrl = String(body?.imageDataUrl || "").trim();
   if (!imageDataUrl.startsWith("data:image/")) {
@@ -76,8 +83,8 @@ export default async function onRequest(context) {
   const cityHint = typeof body?.cityHint === "string" ? body.cityHint.trim() : "";
   const interestHint = typeof body?.interestHint === "string" ? body.interestHint.trim() : "";
 
-  const modelFromKv = await readSecret(env, "BIGMODEL_VISION_MODEL");
-  const model = String(modelFromKv || body?.model || "glm-5v-turbo").trim();
+    const modelFromKv = await readSecret(env, "BIGMODEL_VISION_MODEL");
+    const model = String(modelFromKv || body?.model || "glm-5v-turbo").trim();
 
   const system = [
     "你是一个截图信息抽取与归类助手。",
@@ -119,19 +126,19 @@ export default async function onRequest(context) {
     ]
   };
 
-  let upstream = null;
-  try {
-    upstream = await fetch(BIGMODEL_BASE_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(payload)
-    });
-  } catch (e) {
-    return serverError(`Upstream fetch failed: ${String(e?.message || e)}`);
-  }
+    let upstream = null;
+    try {
+      upstream = await fetch(BIGMODEL_BASE_URL, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(payload)
+      });
+    } catch (e) {
+      return serverError(`Upstream fetch failed: ${String(e?.message || e)}`);
+    }
 
   let raw = null;
   try {
@@ -164,6 +171,16 @@ export default async function onRequest(context) {
   if (!out.interests.length) out.interests = ["未分类"];
   if (!out.city) out.city = "未知";
 
-  return json(out);
+    return json(out);
+  } catch (e) {
+    return json(
+      {
+        error: "Unhandled exception",
+        message: String(e?.message || e),
+        name: e?.name || "Error"
+      },
+      { status: 500 }
+    );
+  }
 }
 

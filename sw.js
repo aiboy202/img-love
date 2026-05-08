@@ -1,4 +1,4 @@
-const CACHE_NAME = "img-love-v1";
+const CACHE_NAME = "img-love-v2";
 const APP_SHELL = [
   "/",
   "/index.html",
@@ -42,6 +42,28 @@ self.addEventListener("fetch", (event) => {
   // Never cache dynamic APIs
   if (url.pathname.startsWith("/api/")) {
     event.respondWith(fetch(req));
+    return;
+  }
+
+  // Always prefer network for app.js to avoid stale UI logic after deploys.
+  if (url.origin === self.location.origin && url.pathname === "/app.js") {
+    event.respondWith(
+      (async () => {
+        try {
+          const res = await fetch(req, { cache: "no-store" });
+          try {
+            const cache = await caches.open(CACHE_NAME);
+            cache.put(req, res.clone());
+          } catch {
+            // ignore
+          }
+          return res;
+        } catch {
+          const cached = await caches.match(req);
+          return cached || Response.error();
+        }
+      })()
+    );
     return;
   }
 
