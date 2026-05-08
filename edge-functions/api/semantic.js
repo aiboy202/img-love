@@ -27,6 +27,30 @@ function safeJsonParse(s) {
   }
 }
 
+async function fetchWithTimeout(url, init, timeoutMs) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(new Error(`timeout ${timeoutMs}ms`)), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: ctrl.signal });
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function fetchWithRetry(url, init, { timeoutMs = 45_000, retries = 2, backoffMs = 600 } = {}) {
+  let lastErr = null;
+  for (let i = 0; i <= retries; i++) {
+    try {
+      return await fetchWithTimeout(url, init, timeoutMs);
+    } catch (e) {
+      lastErr = e;
+      if (i === retries) break;
+      await new Promise((r) => setTimeout(r, backoffMs * (i + 1)));
+    }
+  }
+  throw lastErr || new Error("fetch failed");
+}
+
 function isKvNamespace(v) {
   return (
     v &&
@@ -146,16 +170,30 @@ export default async function onRequest(context) {
 
   let upstream = null;
   try {
-    upstream = await fetch(BIGMODEL_BASE_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json"
+    const timeoutMs = Number(env.BIGMODEL_TIMEOUT_MS || 60_000);
+    upstream = await fetchWithRetry(
+      BIGMODEL_BASE_URL,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(payload)
       },
-      body: JSON.stringify(payload)
-    });
+      { timeoutMs, retries: 2, backoffMs: 800 }
+    );
   } catch (e) {
-    return serverError(`Upstream fetch failed: ${String(e?.message || e)}`);
+    return json(
+      {
+        error: "Upstream fetch failed",
+        message: String(e?.message || e),
+        hint:
+          "Edge Functions may timeout on slow upstream networks. Consider switching this endpoint to Cloud Functions, or set BIGMODEL_TIMEOUT_MS higher (if allowed).",
+        model
+      },
+      { status: 504 }
+    );
   }
 
   let raw = null;
