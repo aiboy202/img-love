@@ -1,0 +1,12 @@
+{
+  "name": "截图收藏 · 分类归档",
+  "short_name": "截图收藏",
+  "description": "导入屏幕截图，自动 OCR 提取文字并按兴趣与城市归类；离线可用；支持跳转高德/大众点评与路线入口。",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0B1220",
+  "theme_color": "#0B1220",
+  "icons": [
+    { "src": "/icons/icon.svg", "sizes": "any", "type": "image/svg+xml" }
+  ]
+}
