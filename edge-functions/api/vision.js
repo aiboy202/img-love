@@ -27,6 +27,26 @@ function safeJsonParse(s) {
   }
 }
 
+function findKv(env) {
+  if (!env || typeof env !== "object") return null;
+  for (const v of Object.values(env)) {
+    if (!v || typeof v !== "object") continue;
+    if (typeof v.get === "function" && typeof v.put === "function" && typeof v.delete === "function") return v;
+  }
+  return null;
+}
+
+async function readSecret(env, key) {
+  if (env && typeof env[key] === "string" && env[key].trim()) return env[key].trim();
+  const kv = findKv(env);
+  if (!kv) return "";
+  const v =
+    (await kv.get(key)) ??
+    (await kv.get(key.toLowerCase())) ??
+    (await kv.get(key.replace(/_/g, "-").toLowerCase()));
+  return typeof v === "string" ? v.trim() : "";
+}
+
 export default async function onRequest(context) {
   const { request } = context;
   if (request.method !== "POST") {
@@ -34,8 +54,12 @@ export default async function onRequest(context) {
   }
 
   const env = context?.env || {};
-  const apiKey = env.BIGMODEL_API_KEY;
-  if (!apiKey) return serverError("Missing env: BIGMODEL_API_KEY");
+  const apiKey = await readSecret(env, "BIGMODEL_API_KEY");
+  if (!apiKey) {
+    return serverError(
+      "Missing BIGMODEL_API_KEY (set as env var, or store it in Pages KV and bind the namespace to this project)."
+    );
+  }
 
   let body = null;
   try {
@@ -52,7 +76,8 @@ export default async function onRequest(context) {
   const cityHint = typeof body?.cityHint === "string" ? body.cityHint.trim() : "";
   const interestHint = typeof body?.interestHint === "string" ? body.interestHint.trim() : "";
 
-  const model = String(env.BIGMODEL_VISION_MODEL || body?.model || "glm-5v-turbo").trim();
+  const modelFromKv = await readSecret(env, "BIGMODEL_VISION_MODEL");
+  const model = String(modelFromKv || body?.model || "glm-5v-turbo").trim();
 
   const system = [
     "你是一个截图信息抽取与归类助手。",

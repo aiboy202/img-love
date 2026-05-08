@@ -27,6 +27,29 @@ function safeJsonParse(s) {
   }
 }
 
+function findKv(env) {
+  if (!env || typeof env !== "object") return null;
+  // KV namespace is bound into env as a variable (object with get/put/delete/list).
+  for (const v of Object.values(env)) {
+    if (!v || typeof v !== "object") continue;
+    if (typeof v.get === "function" && typeof v.put === "function" && typeof v.delete === "function") return v;
+  }
+  return null;
+}
+
+async function readSecret(env, key) {
+  // 1) try env var
+  if (env && typeof env[key] === "string" && env[key].trim()) return env[key].trim();
+  // 2) try KV (keys are often stored as BIGMODEL_API_KEY / BIGMODEL_MODEL etc.)
+  const kv = findKv(env);
+  if (!kv) return "";
+  const v =
+    (await kv.get(key)) ??
+    (await kv.get(key.toLowerCase())) ??
+    (await kv.get(key.replace(/_/g, "-").toLowerCase()));
+  return typeof v === "string" ? v.trim() : "";
+}
+
 export default async function onRequest(context) {
   const { request } = context;
 
@@ -36,8 +59,12 @@ export default async function onRequest(context) {
 
   // EdgeOne Pages Functions provides env vars on context.env (per docs).
   const env = context?.env || {};
-  const apiKey = env.BIGMODEL_API_KEY;
-  if (!apiKey) return serverError("Missing env: BIGMODEL_API_KEY");
+  const apiKey = await readSecret(env, "BIGMODEL_API_KEY");
+  if (!apiKey) {
+    return serverError(
+      "Missing BIGMODEL_API_KEY (set as env var, or store it in Pages KV and bind the namespace to this project)."
+    );
+  }
 
   let body = null;
   try {
@@ -49,7 +76,8 @@ export default async function onRequest(context) {
   const text = String(body?.text || "").trim();
   if (!text) return badRequest("Missing field: text");
 
-  const model = String(env.BIGMODEL_MODEL || body?.model || "glm-5.1").trim();
+  const modelFromKv = await readSecret(env, "BIGMODEL_MODEL");
+  const model = String(modelFromKv || body?.model || "glm-5.1").trim();
 
   const system = [
     "你是一个信息抽取与归类助手。",
