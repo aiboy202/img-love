@@ -232,7 +232,22 @@ async function visionExtract(imageDataUrl, { cityHint, interestHint } = {}) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ imageDataUrl, cityHint, interestHint })
   });
-  if (!res.ok) throw new Error(`视觉识别接口失败：HTTP ${res.status}`);
+  if (!res.ok) {
+    let detail = "";
+    try {
+      const data = await res.json();
+      detail = data?.error ? `：${data.error}` : "";
+      if (data?.details) detail += `\n${JSON.stringify(data.details).slice(0, 1200)}`;
+    } catch {
+      try {
+        const t = await res.text();
+        detail = t ? `\n${t.slice(0, 1200)}` : "";
+      } catch {
+        // ignore
+      }
+    }
+    throw new Error(`视觉识别接口失败：HTTP ${res.status}${detail}`);
+  }
   return await res.json();
 }
 
@@ -268,6 +283,27 @@ async function fileToJpegDataUrl(file, { maxDim = 1280, quality = 0.72 } = {}) {
   ctx.drawImage(img, 0, 0, tw, th);
 
   return canvas.toDataURL("image/jpeg", quality);
+}
+
+async function fileToJpegDataUrlUnderLimit(file, { byteLimit = 900_000 } = {}) {
+  // Edge Functions request body size is ~1MB; keep payload comfortably below that.
+  // Note: dataURL is base64 text; length roughly correlates with bytes.
+  const attempts = [
+    { maxDim: 1280, quality: 0.72 },
+    { maxDim: 1152, quality: 0.68 },
+    { maxDim: 1024, quality: 0.62 },
+    { maxDim: 960, quality: 0.58 },
+    { maxDim: 896, quality: 0.54 }
+  ];
+
+  let last = "";
+  for (const a of attempts) {
+    const d = await fileToJpegDataUrl(file, a);
+    last = d;
+    // Approx bytes for UTF-8 of ASCII string
+    if (d.length <= byteLimit) return d;
+  }
+  return last;
 }
 
 async function getSettings() {
@@ -721,7 +757,7 @@ async function importFiles(files) {
       setProgress("AI 识别中", idx + 1, list.length);
       els.progressBar.style.width = "10%";
 
-      const visionImage = await withTimeout(fileToJpegDataUrl(file), 60_000, "压缩图片");
+      const visionImage = await withTimeout(fileToJpegDataUrlUnderLimit(file), 60_000, "压缩图片");
       els.progressBar.style.width = "25%";
 
       ai = await withTimeout(
