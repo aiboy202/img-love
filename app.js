@@ -345,13 +345,31 @@ function withTimeout(promise, ms, label = "操作") {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(t));
 }
 
+function formatDuration(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return m ? `${m}分${String(r).padStart(2, "0")}秒` : `${r}秒`;
+}
+
+function normalizeTesseractStatus(status) {
+  const s = String(status || "").toLowerCase();
+  if (!s) return "";
+  if (s.includes("loading tesseract core")) return "加载 OCR 引擎";
+  if (s.includes("initializing tesseract")) return "初始化 OCR";
+  if (s.includes("loading language")) return "下载/加载语言包";
+  if (s.includes("initializing api")) return "初始化语言";
+  if (s.includes("recognizing text")) return "识别文字中";
+  return String(status);
+}
+
 const TESSERACT_CDN = {
   workerPath: "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/worker.min.js",
   corePath: "https://cdn.jsdelivr.net/npm/tesseract.js-core@5.1.1",
   langPath: "https://tessdata.projectnaptha.com/4.0.0"
 };
 
-async function ocrImage(file, { lang, onProgress }) {
+async function ocrImage(file, { lang, onProgress, startedAt } = {}) {
   const url = URL.createObjectURL(file);
   try {
     const opts = TESSERACT_CDN;
@@ -369,19 +387,19 @@ async function ocrImage(file, { lang, onProgress }) {
         logger: (m) => {
           if (typeof onProgress === "function") {
             const p = typeof m?.progress === "number" ? m.progress : null;
-            if (p !== null) onProgress(p, m);
+            if (p !== null) onProgress(p, m, startedAt);
           }
         }
       }),
-      60_000,
+      120_000,
       "初始化 OCR"
     );
 
     try {
-      await withTimeout(worker.load(), 90_000, "加载 OCR 引擎");
-      await withTimeout(worker.loadLanguage(lang), 360_000, "下载/加载 OCR 语言包");
-      await withTimeout(worker.initialize(lang), 90_000, "初始化 OCR 语言");
-      const res = await withTimeout(worker.recognize(url), 360_000, "OCR");
+      await withTimeout(worker.load(), 180_000, "加载 OCR 引擎");
+      await withTimeout(worker.loadLanguage(lang), 600_000, "下载/加载 OCR 语言包");
+      await withTimeout(worker.initialize(lang), 180_000, "初始化 OCR 语言");
+      const res = await withTimeout(worker.recognize(url), 600_000, "OCR");
       return res?.data?.text || "";
     } finally {
       // Always terminate to free memory.
@@ -654,13 +672,29 @@ async function importFiles(files) {
 
     let text = "";
     try {
+      const ocrStartedAt = Date.now();
       text = await ocrImage(file, {
         lang: state.settings.ocrLang,
-        onProgress: (p, m) => {
+        startedAt: ocrStartedAt,
+        onProgress: (p, m, startedAt) => {
           const pct = Math.max(0, Math.min(100, Math.round(p * 100)));
           els.progressBar.style.width = `${pct}%`;
-          const status = typeof m?.status === "string" ? m.status : "";
-          if (status) els.progressText.textContent = `${status}（${idx + 1}/${list.length}）`;
+          const raw = typeof m?.status === "string" ? m.status : "";
+          const status = normalizeTesseractStatus(raw);
+          const elapsed = formatDuration(Date.now() - (startedAt || Date.now()));
+
+          if (!status) return;
+
+          let extra = "";
+          const slowHintAfterMs = 2 * 60_000;
+          if (Date.now() - (startedAt || Date.now()) > slowHintAfterMs) {
+            extra =
+              "\n（首次下载引擎/语言包可能较慢；若长时间无进度，可能被网络/扩展拦截，可在 F12→Network 查看请求是否超时/被拦）";
+          } else if (status.includes("下载/加载语言包") || status.includes("加载 OCR 引擎")) {
+            extra = "\n（首次使用需要下载资源，耐心等一下）";
+          }
+
+          els.progressText.textContent = `${status} · 已用时 ${elapsed}（${idx + 1}/${list.length}）${extra}`;
         }
       });
     } catch (e) {
