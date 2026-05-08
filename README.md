@@ -50,3 +50,15 @@ python -m http.server 5173
 - 从截图来源 App（抖音/小红书/大众点评）识别内容结构与字段
 - 账号同步（多设备）：需要后端或云存储（会涉及隐私策略与合规）
 
+## SCF（腾讯云云函数）替代 Edge Functions（推荐）
+
+如果 EdgeOne Edge Functions 调用智谱上游经常超时，可以把大模型调用迁到腾讯云 SCF。
+
+- **SCF 代码**：`scf/vision/index.js`
+- **需要的 SCF 环境变量**：
+  - `BIGMODEL_API_KEY`（必填）
+  - `BIGMODEL_VISION_MODEL`（可选，默认 `glm-5v-turbo`）
+  - `BIGMODEL_TIMEOUT_MS`（可选，默认 60000）
+- **触发器**：建议用 API 网关（HTTP）触发，并开启 CORS
+- **前端配置**：在 `index.html` 里设置 `globalThis.__APP_CONFIG__.VISION_API_URL` 为你的 SCF API 网关地址
+

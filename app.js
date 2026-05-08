@@ -227,7 +227,10 @@ async function semanticExtract(text) {
 }
 
 async function visionExtract(imageDataUrl, { cityHint, interestHint } = {}) {
-  const res = await fetch("/api/vision", {
+  const url =
+    (globalThis.__APP_CONFIG__ && typeof globalThis.__APP_CONFIG__.VISION_API_URL === "string" && globalThis.__APP_CONFIG__.VISION_API_URL.trim()) ||
+    "/api/vision";
+  const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ imageDataUrl, cityHint, interestHint })
