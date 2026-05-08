@@ -227,9 +227,13 @@ async function semanticExtract(text) {
 }
 
 async function visionExtract(imageDataUrl, { cityHint, interestHint } = {}) {
-  const url =
+  let url =
     (globalThis.__APP_CONFIG__ && typeof globalThis.__APP_CONFIG__.VISION_API_URL === "string" && globalThis.__APP_CONFIG__.VISION_API_URL.trim()) ||
     "/api/vision";
+  // If the user provides a SCF base URL, default to /api/vision path.
+  if (url.startsWith("http") && !url.includes("/api/") && !url.endsWith("/vision") && !url.endsWith("/api/vision")) {
+    url = url.replace(/\/+$/, "") + "/api/vision";
+  }
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
