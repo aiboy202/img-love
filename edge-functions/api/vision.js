@@ -27,18 +27,48 @@ function safeJsonParse(s) {
   }
 }
 
-function findKv(env) {
-  if (!env || typeof env !== "object") return null;
-  for (const v of Object.values(env)) {
-    if (!v || typeof v !== "object") continue;
-    if (typeof v.get === "function" && typeof v.put === "function" && typeof v.delete === "function") return v;
+function isKvNamespace(v) {
+  return (
+    v &&
+    typeof v === "object" &&
+    typeof v.get === "function" &&
+    typeof v.put === "function" &&
+    typeof v.delete === "function" &&
+    typeof v.list === "function"
+  );
+}
+
+function findKvInObject(obj) {
+  if (!obj || typeof obj !== "object") return null;
+  for (const [k, v] of Object.entries(obj)) {
+    if (isKvNamespace(v)) return { name: k, kv: v };
+  }
+  return null;
+}
+
+function findKvAny(context) {
+  // 1) context.env (some deployments expose KV bindings here)
+  const envHit = findKvInObject(context?.env);
+  if (envHit) return envHit;
+  // 2) globalThis injection (docs examples often use the bound var name directly, e.g. my_kv.get())
+  try {
+    // Scan a limited subset to avoid huge overhead; still good enough for typical Pages runtimes.
+    for (const k of Object.getOwnPropertyNames(globalThis)) {
+      // Skip obviously irrelevant builtins quickly
+      if (k.length > 64) continue;
+      const v = globalThis[k];
+      if (isKvNamespace(v)) return { name: k, kv: v };
+    }
+  } catch {
+    // ignore
   }
   return null;
 }
 
 async function readSecret(env, key) {
   if (env && typeof env[key] === "string" && env[key].trim()) return env[key].trim();
-  const kv = findKv(env);
+  const hit = findKvAny({ env });
+  const kv = hit?.kv;
   if (!kv) return "";
   const v =
     (await kv.get(key)) ??
@@ -55,14 +85,24 @@ export default async function onRequest(context) {
     }
 
     const env = context?.env || {};
-    const kvBound = Boolean(findKv(env));
-    const apiKey = await readSecret(env, "BIGMODEL_API_KEY");
+    const kvHit = findKvAny(context);
+    const kvBound = Boolean(kvHit?.kv);
+    const kvVarName = kvHit?.name || "";
+    const apiKey = await (async () => {
+      // Try env first, then KV (either in context.env or globalThis)
+      if (typeof env.BIGMODEL_API_KEY === "string" && env.BIGMODEL_API_KEY.trim()) return env.BIGMODEL_API_KEY.trim();
+      const kv = kvHit?.kv;
+      if (!kv) return "";
+      const v = await kv.get("BIGMODEL_API_KEY");
+      return typeof v === "string" ? v.trim() : "";
+    })();
     if (!apiKey) {
       return json(
         {
           error: "Missing BIGMODEL_API_KEY",
           hint: "Set env var BIGMODEL_API_KEY, or store it in a bound Pages KV namespace with key BIGMODEL_API_KEY.",
-          kvBound
+          kvBound,
+          kvVarName
         },
         { status: 500 }
       );
@@ -83,7 +123,13 @@ export default async function onRequest(context) {
   const cityHint = typeof body?.cityHint === "string" ? body.cityHint.trim() : "";
   const interestHint = typeof body?.interestHint === "string" ? body.interestHint.trim() : "";
 
-    const modelFromKv = await readSecret(env, "BIGMODEL_VISION_MODEL");
+    const modelFromKv = await (async () => {
+      if (typeof env.BIGMODEL_VISION_MODEL === "string" && env.BIGMODEL_VISION_MODEL.trim()) return env.BIGMODEL_VISION_MODEL.trim();
+      const kv = kvHit?.kv;
+      if (!kv) return "";
+      const v = await kv.get("BIGMODEL_VISION_MODEL");
+      return typeof v === "string" ? v.trim() : "";
+    })();
     const model = String(modelFromKv || body?.model || "glm-5v-turbo").trim();
 
   const system = [

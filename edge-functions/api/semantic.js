@@ -27,12 +27,36 @@ function safeJsonParse(s) {
   }
 }
 
-function findKv(env) {
-  if (!env || typeof env !== "object") return null;
-  // KV namespace is bound into env as a variable (object with get/put/delete/list).
-  for (const v of Object.values(env)) {
-    if (!v || typeof v !== "object") continue;
-    if (typeof v.get === "function" && typeof v.put === "function" && typeof v.delete === "function") return v;
+function isKvNamespace(v) {
+  return (
+    v &&
+    typeof v === "object" &&
+    typeof v.get === "function" &&
+    typeof v.put === "function" &&
+    typeof v.delete === "function" &&
+    typeof v.list === "function"
+  );
+}
+
+function findKvInObject(obj) {
+  if (!obj || typeof obj !== "object") return null;
+  for (const [k, v] of Object.entries(obj)) {
+    if (isKvNamespace(v)) return { name: k, kv: v };
+  }
+  return null;
+}
+
+function findKvAny(context) {
+  const envHit = findKvInObject(context?.env);
+  if (envHit) return envHit;
+  try {
+    for (const k of Object.getOwnPropertyNames(globalThis)) {
+      if (k.length > 64) continue;
+      const v = globalThis[k];
+      if (isKvNamespace(v)) return { name: k, kv: v };
+    }
+  } catch {
+    // ignore
   }
   return null;
 }
@@ -41,7 +65,8 @@ async function readSecret(env, key) {
   // 1) try env var
   if (env && typeof env[key] === "string" && env[key].trim()) return env[key].trim();
   // 2) try KV (keys are often stored as BIGMODEL_API_KEY / BIGMODEL_MODEL etc.)
-  const kv = findKv(env);
+  const hit = findKvAny({ env });
+  const kv = hit?.kv;
   if (!kv) return "";
   const v =
     (await kv.get(key)) ??
@@ -59,7 +84,14 @@ export default async function onRequest(context) {
 
   // EdgeOne Pages Functions provides env vars on context.env (per docs).
   const env = context?.env || {};
-  const apiKey = await readSecret(env, "BIGMODEL_API_KEY");
+  const kvHit = findKvAny(context);
+  const apiKey = await (async () => {
+    if (typeof env.BIGMODEL_API_KEY === "string" && env.BIGMODEL_API_KEY.trim()) return env.BIGMODEL_API_KEY.trim();
+    const kv = kvHit?.kv;
+    if (!kv) return "";
+    const v = await kv.get("BIGMODEL_API_KEY");
+    return typeof v === "string" ? v.trim() : "";
+  })();
   if (!apiKey) {
     return serverError(
       "Missing BIGMODEL_API_KEY (set as env var, or store it in Pages KV and bind the namespace to this project)."
@@ -76,7 +108,13 @@ export default async function onRequest(context) {
   const text = String(body?.text || "").trim();
   if (!text) return badRequest("Missing field: text");
 
-  const modelFromKv = await readSecret(env, "BIGMODEL_MODEL");
+  const modelFromKv = await (async () => {
+    if (typeof env.BIGMODEL_MODEL === "string" && env.BIGMODEL_MODEL.trim()) return env.BIGMODEL_MODEL.trim();
+    const kv = kvHit?.kv;
+    if (!kv) return "";
+    const v = await kv.get("BIGMODEL_MODEL");
+    return typeof v === "string" ? v.trim() : "";
+  })();
   const model = String(modelFromKv || body?.model || "glm-5.1").trim();
 
   const system = [
