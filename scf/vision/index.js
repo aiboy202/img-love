@@ -12,6 +12,19 @@
 const BIGMODEL_BASE_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions";
 const DEFAULT_VISION_MODEL = "glm-4.6v";
 
+/** 部分触发器把整段 event 序列化成字符串传入 */
+function normalizeEvent(raw) {
+  if (raw == null) return {};
+  if (typeof raw === "string") {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return {};
+    }
+  }
+  return raw;
+}
+
 /** 从腾讯云多种 HTTP 触发器 event 中取请求方法（大小写不敏感） */
 function getHttpMethod(event) {
   const m =
@@ -21,6 +34,37 @@ function getHttpMethod(event) {
     event?.requestContext?.httpMethod ||
     event?.RequestContext?.Http?.Method;
   return typeof m === "string" ? m.toUpperCase() : "";
+}
+
+/** 少数接入未带 httpMethod；有 JSON body 时按 POST 处理 */
+function inferHttpMethod(event, bodyStr) {
+  const direct = getHttpMethod(event);
+  if (direct) return direct;
+  if (event?.body && typeof event.body === "object" && String(event.body?.imageDataUrl || "").startsWith("data:image/")) {
+    return "POST";
+  }
+  if (bodyStr && /^\s*\{/.test(bodyStr)) return "POST";
+  return "";
+}
+
+/** 预检时回显浏览器请求的 Header，避免 Allow-Headers 不匹配导致浏览器报 Failed to fetch */
+function corsHeaders(event) {
+  const h = event?.headers || event?.header;
+  let allowHeaders = "Content-Type, Authorization";
+  if (h && typeof h === "object") {
+    for (const [k, v] of Object.entries(h)) {
+      if (String(k).toLowerCase() === "access-control-request-headers" && v != null && String(v).trim()) {
+        allowHeaders = String(v).trim();
+        break;
+      }
+    }
+  }
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+    "Access-Control-Allow-Headers": allowHeaders,
+    "Access-Control-Max-Age": "86400"
+  };
 }
 
 /** 取原始 body 字符串；兼容 isBase64Encoded */
@@ -39,7 +83,9 @@ function getBodyString(event) {
   return raw;
 }
 
-function json(statusCode, data, extraHeaders = {}) {
+/** @param {object|null} event 原始 HTTP event（用于 CORS 预检回显 Header）；可传 null */
+function json(statusCode, data, event = null, extraHeaders = {}) {
+  const cors = corsHeaders(event || {});
   const body = typeof data === "string" ? data : JSON.stringify(data);
   return {
     isBase64Encoded: false,
@@ -47,9 +93,7 @@ function json(statusCode, data, extraHeaders = {}) {
     headers: {
       "Content-Type": "application/json; charset=utf-8",
       "Cache-Control": "no-store",
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type,Authorization",
+      ...cors,
       ...extraHeaders
     },
     body: statusCode === 204 ? "" : body
@@ -67,40 +111,45 @@ async function fetchWithTimeout(url, init, timeoutMs) {
 }
 
 async function handleVision(event) {
-  const method = getHttpMethod(event);
+  const bodyStrEarly = getBodyString(event);
+  const method = inferHttpMethod(event, bodyStrEarly);
 
-  if (method === "OPTIONS") return json(204, "");
+  if (method === "OPTIONS") return json(204, "", event);
   if (method === "GET") {
-    return json(200, {
-      ok: true,
-      service: "img_love/vision",
-      hint: "POST JSON：{ imageDataUrl, cityHint?, interestHint?, model? }；需配置 BIGMODEL_API_KEY"
-    });
+    return json(
+      200,
+      {
+        ok: true,
+        service: "img_love/vision",
+        hint: "POST JSON：{ imageDataUrl, cityHint?, interestHint?, model? }；需配置 BIGMODEL_API_KEY"
+      },
+      event
+    );
   }
   if (method !== "POST") {
-    return json(405, { error: "Method Not Allowed", method: method || "(empty)" }, { Allow: "GET,POST,OPTIONS" });
+    return json(405, { error: "Method Not Allowed", method: method || "(empty)" }, event, { Allow: "GET,POST,OPTIONS" });
   }
 
   const apiKey = process.env.BIGMODEL_API_KEY;
-  if (!apiKey) return json(500, { error: "Missing env: BIGMODEL_API_KEY" });
+  if (!apiKey) return json(500, { error: "Missing env: BIGMODEL_API_KEY" }, event);
 
-  const bodyStr = getBodyString(event);
+  const bodyStr = bodyStrEarly || getBodyString(event);
   let body = null;
   if (bodyStr) {
     try {
       body = JSON.parse(bodyStr);
     } catch {
-      return json(400, { error: "Invalid JSON body" });
+      return json(400, { error: "Invalid JSON body" }, event);
     }
   } else if (event?.body && typeof event.body === "object") {
     body = event.body;
   } else {
-    return json(400, { error: "Missing request body" });
+    return json(400, { error: "Missing request body" }, event);
   }
 
   const imageDataUrl = String(body?.imageDataUrl || "").trim();
   if (!imageDataUrl.startsWith("data:image/")) {
-    return json(400, { error: "Missing/invalid field: imageDataUrl (data:image/*;base64,...)" });
+    return json(400, { error: "Missing/invalid field: imageDataUrl (data:image/*;base64,...)" }, event);
   }
 
   const cityHint = typeof body?.cityHint === "string" ? body.cityHint.trim() : "";
@@ -160,17 +209,17 @@ async function handleVision(event) {
       timeoutMs
     );
   } catch (e) {
-    return json(504, { error: "Upstream fetch failed", message: String(e?.message || e), model });
+    return json(504, { error: "Upstream fetch failed", message: String(e?.message || e), model }, event);
   }
 
   let raw = null;
   try {
     raw = await upstream.json();
   } catch {
-    return json(502, { error: "Upstream non-JSON response", status: upstream.status });
+    return json(502, { error: "Upstream non-JSON response", status: upstream.status }, event);
   }
 
-  if (!upstream.ok) return json(502, { error: "Upstream error", status: upstream.status, details: raw });
+  if (!upstream.ok) return json(502, { error: "Upstream error", status: upstream.status, details: raw }, event);
 
   const content = raw?.choices?.[0]?.message?.content;
   let parsed = null;
@@ -179,13 +228,22 @@ async function handleVision(event) {
   } catch {
     parsed = null;
   }
-  if (!parsed || typeof parsed !== "object") return json(502, { error: "Model output is not valid JSON", content });
+  if (!parsed || typeof parsed !== "object") {
+    return json(502, { error: "Model output is not valid JSON", content }, event);
+  }
 
-  return json(200, parsed);
+  return json(200, parsed, event);
 }
 
 /** 控制台「执行方法」填 main_handler 或 main 均可 */
-const main_handler = async (event) => handleVision(event);
+const main_handler = async (rawEvent) => {
+  const event = normalizeEvent(rawEvent);
+  try {
+    return await handleVision(event);
+  } catch (e) {
+    return json(500, { error: "Unhandled exception", message: String(e?.message || e) }, event);
+  }
+};
 const main = main_handler;
 
 exports.main_handler = main_handler;

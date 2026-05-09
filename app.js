@@ -241,11 +241,32 @@ async function visionExtract(imageDataUrl, { cityHint, interestHint } = {}) {
   ) {
     url = url.replace(/\/+$/, "") + "/api/vision";
   }
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ imageDataUrl, cityHint, interestHint })
-  });
+  let res;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      mode: "cors",
+      credentials: "omit",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ imageDataUrl, cityHint, interestHint })
+    });
+  } catch (e) {
+    const u = (() => {
+      try {
+        return new URL(url);
+      } catch {
+        return null;
+      }
+    })();
+    const host = u ? u.host : url;
+    const isCrossOrigin = u && u.origin !== globalThis.location?.origin;
+    throw new Error(
+      `网络请求失败（${String(e?.message || e)}）。` +
+        (isCrossOrigin
+          ? `当前页：${globalThis.location?.origin || ""}，接口：${host}。请在浏览器 F12 → Network 查看该请求是否被 CORS 拦截；若在腾讯云 API 网关上托管，需在网关上开启/放行 CORS，或确保函数返回含 Access-Control-Allow-Origin。`
+          : `请 F12 → Network 查看 ${url} 是否连通。`)
+    );
+  }
   if (!res.ok) {
     let detail = "";
     try {
@@ -789,7 +810,7 @@ async function importFiles(files) {
       showProgress(false);
       const msg = String(e?.message || e || "未知错误");
       alert(
-        `AI 识别失败：${msg}\n\n建议排查：\n1) Edge 按 F12 → Network，确认 /api/vision 是否返回 200。\n2) EdgeOne Functions 是否已配置 BIGMODEL_API_KEY。\n3) 若返回 502，查看 details 里的上游错误信息。`
+        `AI 识别失败：${msg}\n\n建议排查：\n1) F12 → Network：看 VISION 请求是红色还是 OPTIONS 失败（多为跨域/CORS）。\n2) 用浏览器直接打开云函数 URL，应能看到 JSON 健康说明（GET）。\n3) 腾讯云 API 网关需在控制台配置 CORS，或确认后端错误响应也带 Access-Control-Allow-Origin。\n4) 使用 /api/vision 时：EdgeOne 是否已配置 BIGMODEL_API_KEY；502 时看响应 body 里 details。`
       );
       throw e;
     }
