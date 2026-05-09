@@ -38,6 +38,8 @@ self.addEventListener("fetch", (event) => {
   const url = new URL(req.url);
 
   if (req.method !== "GET") return;
+  // Extensions may inject chrome-extension:// requests; Cache API can't store them.
+  if (url.protocol !== "http:" && url.protocol !== "https:") return;
 
   // Never cache dynamic APIs
   if (url.pathname.startsWith("/api/")) {
@@ -115,8 +117,12 @@ self.addEventListener("fetch", (event) => {
       if (cached) return cached;
       try {
         const res = await fetch(req);
-        const cache = await caches.open(CACHE_NAME);
-        cache.put(req, res.clone());
+        try {
+          const cache = await caches.open(CACHE_NAME);
+          await cache.put(req, res.clone());
+        } catch {
+          // ignore cache put failures (e.g. opaque/unsupported schemes)
+        }
         return res;
       } catch {
         if (url.pathname === "/" || url.pathname.endsWith(".html")) {
