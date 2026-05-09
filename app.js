@@ -230,8 +230,15 @@ async function visionExtract(imageDataUrl, { cityHint, interestHint } = {}) {
   let url =
     (globalThis.__APP_CONFIG__ && typeof globalThis.__APP_CONFIG__.VISION_API_URL === "string" && globalThis.__APP_CONFIG__.VISION_API_URL.trim()) ||
     "/api/vision";
-  // If the user provides a SCF base URL, default to /api/vision path.
-  if (url.startsWith("http") && !url.includes("/api/") && !url.endsWith("/vision") && !url.endsWith("/api/vision")) {
+  // 腾讯云「函数 URL / tencentscf.com」一般根路径即函数，不要再拼 /api/vision。
+  const isTencentScfUrl = /^https?:\/\//i.test(url) && /\.tencentscf\.com\b/i.test(url);
+  if (
+    url.startsWith("http") &&
+    !isTencentScfUrl &&
+    !url.includes("/api/") &&
+    !url.endsWith("/vision") &&
+    !url.endsWith("/api/vision")
+  ) {
     url = url.replace(/\/+$/, "") + "/api/vision";
   }
   const res = await fetch(url, {

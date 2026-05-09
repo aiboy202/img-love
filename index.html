@@ -188,8 +188,7 @@
     <!-- Use non-module CDN scripts for maximum mobile compatibility -->
     <script src="https://cdn.jsdelivr.net/npm/idb@8/build/iife/index-min.js"></script>
     <script>
-      // Runtime config (set your SCF URL here after you create it)
-      // Example: https://service-xxxx.ap-guangzhou.apigw.tencentcs.com/release/vision
+      // Runtime config：腾讯云函数 URL（*.tencentscf.com）填根地址即可；API 网关可填带路径的完整 URL
       globalThis.__APP_CONFIG__ = {
         VISION_API_URL: "https://1303863544-4dpqnn1733.ap-guangzhou.tencentscf.com"
       };

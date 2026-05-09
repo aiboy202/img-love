@@ -57,8 +57,11 @@ python -m http.server 5173
 - **SCF 代码**：`scf/vision/index.js`
 - **需要的 SCF 环境变量**：
   - `BIGMODEL_API_KEY`（必填）
-  - `BIGMODEL_VISION_MODEL`（可选，默认 `glm-5v-turbo`）
+  - `BIGMODEL_VISION_MODEL`（可选，默认 `glm-4.6v`；**不要用 `glm-4.5-air` 做截图**，该模型为纯文本，需多模态如 `glm-4.6v` / `glm-5v-turbo`）
   - `BIGMODEL_TIMEOUT_MS`（可选，默认 60000）
-- **触发器**：建议用 API 网关（HTTP）触发，并开启 CORS
-- **前端配置**：在 `index.html` 里设置 `globalThis.__APP_CONFIG__.VISION_API_URL` 为你的 SCF API 网关地址
+- **触发器**：API 网关 HTTP 或「函数 URL」均可；典型 `event` 含 `httpMethod`、`body`、`isBase64Encoded`；API 网关 3.0 还可能用 `requestContext.http.method`。代码里已做兼容，并支持 `GET` 健康检查、`OPTIONS` 预检。
+- **执行方法**：可填 `main_handler` 或 `main`（均已导出）。
+- **前端配置**：在 `index.html` 里设置 `globalThis.__APP_CONFIG__.VISION_API_URL`。若为 `*.tencentscf.com` 的函数 URL，填根地址即可（前端不会自动追加 `/api/vision`）。
+
+纯文本归类接口（Edge）：`/api/semantic` 默认模型为 **`glm-4.5-air`**（可用环境变量 `BIGMODEL_MODEL` 覆盖）。
 

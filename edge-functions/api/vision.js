@@ -154,7 +154,7 @@ export default async function onRequest(context) {
       const v = await kv.get("BIGMODEL_VISION_MODEL");
       return typeof v === "string" ? v.trim() : "";
     })();
-    const model = String(modelFromKv || body?.model || "glm-5v-turbo").trim();
+    const model = String(modelFromKv || body?.model || "glm-4.6v").trim();
 
   const system = [
     "你是一个截图信息抽取与归类助手。",
