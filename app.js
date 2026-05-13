@@ -1,4 +1,4 @@
-const APP_VERSION = "pwa-mvp-0.2-amap-v2";
+const APP_VERSION = "pwa-mvp-0.2-amap-v3";
 
 const DEFAULT_SETTINGS = {
   ocrLang: "chi_sim",
