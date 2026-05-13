@@ -1,9 +1,13 @@
-const APP_VERSION = "pwa-mvp-0.1";
+const APP_VERSION = "pwa-mvp-0.2-amap";
 
 const DEFAULT_SETTINGS = {
   ocrLang: "chi_sim",
   classifierMode: "rules",
-  currentCity: "全部"
+  currentCity: "全部",
+  amapJsKey: "",
+  amapSecurityCode: "",
+  // 高德 JS API 代理：填 https://你的域名/_AMapService（与 AMAP_API_URL 无关，见设置页说明）
+  amapServiceHost: ""
 };
 
 const INTERESTS = [
@@ -59,7 +63,7 @@ const CITY_CANDIDATES = [
 ];
 
 const DB_NAME = "img-love";
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 
 function openDBFallback(name, version, { upgrade } = {}) {
   const promisifyRequest = (req) =>
@@ -136,8 +140,8 @@ function openDBFallback(name, version, { upgrade } = {}) {
 
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(name, version);
-    req.onupgradeneeded = () => {
-      if (typeof upgrade === "function") upgrade(req.result);
+    req.onupgradeneeded = (ev) => {
+      if (typeof upgrade === "function") upgrade(ev.target.result, ev.oldVersion, ev.newVersion, ev.target.transaction);
     };
     req.onsuccess = () => resolve(wrapDb(req.result));
     req.onerror = () => reject(req.error);
@@ -160,12 +164,12 @@ function assertDeps() {
 assertDeps();
 
 const dbPromise = globalThis.idb.openDB(DB_NAME, DB_VERSION, {
-  upgrade(db) {
+  upgrade(db, oldVersion, newVersion, tx) {
     let store = null;
-    if (db.objectStoreNames.contains("items")) {
-      store = db.transaction.objectStore("items");
-    } else {
+    if (!db.objectStoreNames.contains("items")) {
       store = db.createObjectStore("items", { keyPath: "id" });
+    } else {
+      store = tx.objectStore("items");
     }
 
     if (!store.indexNames.contains("createdAt")) store.createIndex("createdAt", "createdAt");
@@ -173,6 +177,36 @@ const dbPromise = globalThis.idb.openDB(DB_NAME, DB_VERSION, {
     if (!store.indexNames.contains("primaryInterest")) store.createIndex("primaryInterest", "primaryInterest");
 
     if (!db.objectStoreNames.contains("kv")) db.createObjectStore("kv");
+
+    if (oldVersion < 3 && db.objectStoreNames.contains("items") && tx) {
+      const st = tx.objectStore("items");
+      st.openCursor().onsuccess = (ev) => {
+        const cursor = ev.target.result;
+        if (!cursor) return;
+        const it = cursor.value;
+        if (!Array.isArray(it.places) || it.places.length === 0) {
+          const legacyPoi = typeof it.poi === "string" ? it.poi.trim() : "";
+          const legacyAddr = typeof it.address === "string" ? it.address.trim() : "";
+          const tags = Array.isArray(it.interests) && it.interests.length ? it.interests : ["未分类"];
+          it.places = [
+            {
+              id: `mig_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 9)}`,
+              categoryTags: tags,
+              name: legacyPoi || (it.title || "").trim(),
+              road: "",
+              district: "",
+              addressHint: legacyAddr,
+              note: "",
+              rawQuote: "",
+              amap: null,
+              resolveStatus: legacyPoi || legacyAddr ? "pending" : "empty"
+            }
+          ];
+        }
+        cursor.update(it);
+        cursor.continue();
+      };
+    }
   }
 });
 
@@ -284,6 +318,382 @@ async function visionExtract(imageDataUrl, { cityHint, interestHint } = {}) {
     throw new Error(`视觉识别接口失败：HTTP ${res.status}${detail}`);
   }
   return await res.json();
+}
+
+/**
+ * 浏览器调用的「自建高德 Web 服务代理」完整 URL（与高德 JS API 的 _AMapSecurityConfig.serviceHost 不是同一概念）。
+ * __APP_CONFIG__.AMAP_API_URL：
+ * - 留空：同域相对路径 `/api/amap`（EdgeOne / Vercel 与 Pages Functions 同部署时常用）
+ * - `https://api.example.com`：自动拼为 `https://api.example.com/api/amap`
+ * - `https://api.example.com/api/amap` 或任意非根 path：原样使用（便于自定义网关路径）
+ * - `https://*.tencentscf.com` 且 path 为 `/`：云函数 URL 根触发，不自动追加（需在函数内实现 amap 或填带 path 的完整 URL）
+ */
+function getAmapApiBase() {
+  const raw = (globalThis.__APP_CONFIG__?.AMAP_API_URL || "").trim();
+  if (!raw) return "/api/amap";
+
+  const base = raw.replace(/\/+$/, "");
+  if (!/^https?:\/\//i.test(base)) return "/api/amap";
+
+  try {
+    const u = new URL(base);
+    const isTencentScf = /\.tencentscf\.com$/i.test(u.hostname);
+    const path = (u.pathname || "/").replace(/\/+$/, "") || "/";
+    if (path !== "/") return base;
+    if (isTencentScf) return base;
+    return `${base}/api/amap`;
+  } catch {
+    return "/api/amap";
+  }
+}
+
+async function amapRest(payload) {
+  const base = getAmapApiBase();
+  const res = await fetch(base, {
+    method: "POST",
+    mode: "cors",
+    credentials: "omit",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data?.error || `高德代理 HTTP ${res.status}`);
+  return data;
+}
+
+function buildPlaceSearchKeyword(city, place) {
+  const parts = [
+    city && city !== "未知" && city !== "全部" ? city : "",
+    place?.district || "",
+    place?.road || "",
+    place?.name || "",
+    place?.addressHint || "",
+    place?.note || ""
+  ]
+    .map((s) => String(s || "").trim())
+    .filter(Boolean);
+  const q = parts.join(" ").replace(/\s+/g, " ").trim();
+  return q.slice(0, 96);
+}
+
+function parseLngLatStr(s) {
+  if (!s || typeof s !== "string") return null;
+  const [a, b] = s.split(",").map((x) => Number(String(x).trim()));
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
+  return { lng: a, lat: b };
+}
+
+function haversineMeters(a, b) {
+  if (!a || !b) return null;
+  const R = 6371000;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(b.lat - a.lat);
+  const dLng = toRad(b.lng - a.lng);
+  const lat1 = toRad(a.lat);
+  const lat2 = toRad(b.lat);
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
+function formatDistanceM(m) {
+  if (m == null || !Number.isFinite(m)) return "";
+  if (m < 1000) return `${Math.round(m)} m`;
+  return `${(m / 1000).toFixed(1)} km`;
+}
+
+function placesFromVisionPayload(ai, fallbackCity) {
+  const city = typeof ai?.city === "string" && ai.city.trim() ? ai.city.trim() : fallbackCity || "未知";
+  const raw = Array.isArray(ai?.places) ? ai.places : [];
+  const out = [];
+  for (const p of raw) {
+    if (!p || typeof p !== "object") continue;
+    const categoryTags = Array.isArray(p.categoryTags)
+      ? p.categoryTags.map((x) => String(x).trim()).filter(Boolean).slice(0, 8)
+      : [];
+    out.push({
+      id: uid(),
+      categoryTags: categoryTags.length ? categoryTags : ["未分类"],
+      name: typeof p.name === "string" ? p.name.trim() : "",
+      road: typeof p.road === "string" ? p.road.trim() : "",
+      district: typeof p.district === "string" ? p.district.trim() : "",
+      addressHint: typeof p.addressHint === "string" ? p.addressHint.trim() : "",
+      note: typeof p.note === "string" ? p.note.trim() : "",
+      rawQuote: typeof p.rawQuote === "string" ? p.rawQuote.trim() : "",
+      amap: null,
+      resolveStatus: "pending"
+    });
+  }
+  if (!out.length) {
+    const poi = typeof ai?.poi === "string" ? ai.poi.trim() : "";
+    const addr = typeof ai?.address === "string" ? ai.address.trim() : "";
+    out.push({
+      id: uid(),
+      categoryTags: Array.isArray(ai?.interests) && ai.interests.length ? ai.interests.map((x) => String(x).trim()).filter(Boolean) : ["未分类"],
+      name: poi,
+      road: "",
+      district: "",
+      addressHint: addr,
+      note: "",
+      rawQuote: "",
+      amap: null,
+      resolveStatus: poi || addr ? "pending" : "empty"
+    });
+  }
+  for (const pl of out) {
+    const kw = buildPlaceSearchKeyword(city, pl);
+    if (!kw) pl.resolveStatus = "empty";
+  }
+  return { city, places: out };
+}
+
+function ensureItemPlacesShape(it) {
+  if (!it || typeof it !== "object") return it;
+  if (Array.isArray(it.places) && it.places.length) return it;
+  const legacyPoi = typeof it.poi === "string" ? it.poi.trim() : "";
+  const legacyAddr = typeof it.address === "string" ? it.address.trim() : "";
+  const tags = Array.isArray(it.interests) && it.interests.length ? it.interests : ["未分类"];
+  it.places = [
+    {
+      id: uid(),
+      categoryTags: tags,
+      name: legacyPoi || (it.title || "").trim(),
+      road: "",
+      district: "",
+      addressHint: legacyAddr,
+      note: "",
+      rawQuote: "",
+      amap: null,
+      resolveStatus: legacyPoi || legacyAddr ? "pending" : "empty"
+    }
+  ];
+  return it;
+}
+
+async function resolvePlacesAmap(item) {
+  ensureItemPlacesShape(item);
+  const city = item.city || "未知";
+  const pending = item.places.filter((p) => p && p.resolveStatus === "pending");
+  if (!pending.length) return item;
+
+  const queries = [];
+  for (const pl of pending) {
+    const keywords = buildPlaceSearchKeyword(city, pl);
+    if (!keywords) {
+      pl.resolveStatus = "empty";
+      continue;
+    }
+    queries.push({ refId: pl.id, keywords });
+  }
+  if (!queries.length) return item;
+
+  try {
+    const batchSize = 12;
+    for (let i = 0; i < queries.length; i += batchSize) {
+      const chunk = queries.slice(i, i + batchSize);
+      const data = await amapRest({ action: "resolvePlaces", city, queries: chunk });
+      const results = Array.isArray(data?.results) ? data.results : [];
+      const chunkIds = new Set(chunk.map((q) => q.refId));
+      const byId = new Map(results.map((r) => [r.refId, r]));
+      for (const pl of pending) {
+        if (!chunkIds.has(pl.id)) continue;
+        const r = byId.get(pl.id);
+        if (r && r.ok && r.pick && r.pick.location) {
+          pl.amap = {
+            id: r.pick.id,
+            name: r.pick.name,
+            address: r.pick.address,
+            location: r.pick.location,
+            typecode: r.pick.typecode
+          };
+          pl.resolveStatus = "ok";
+        } else {
+          pl.amap = null;
+          pl.resolveStatus = "fail";
+        }
+      }
+    }
+    for (const pl of pending) {
+      if (pl.resolveStatus === "pending") {
+        pl.resolveStatus = "fail";
+        pl.amap = null;
+      }
+    }
+  } catch {
+    for (const pl of pending) {
+      if (pl.resolveStatus === "pending") {
+        pl.resolveStatus = "fail";
+        pl.amap = null;
+      }
+    }
+  }
+  return item;
+}
+
+function loadScriptOnce(src) {
+  return new Promise((resolve, reject) => {
+    if (document.querySelector(`script[data-src="${src}"]`)) return resolve();
+    const s = document.createElement("script");
+    s.dataset.src = src;
+    s.src = src;
+    s.async = true;
+    s.onload = () => resolve();
+    s.onerror = () => reject(new Error("Failed to load: " + src));
+    document.head.appendChild(s);
+  });
+}
+
+const mapRuntime = {
+  map: null,
+  cluster: null,
+  markers: [],
+  polyline: null,
+  userLngLat: null,
+  AMap: null
+};
+
+function destroyMapRuntime() {
+  try {
+    mapRuntime.cluster?.setMap?.(null);
+  } catch {
+    // ignore
+  }
+  mapRuntime.cluster = null;
+  try {
+    mapRuntime.polyline?.setMap?.(null);
+  } catch {
+    // ignore
+  }
+  mapRuntime.polyline = null;
+  for (const m of mapRuntime.markers) {
+    try {
+      m.setMap(null);
+    } catch {
+      // ignore
+    }
+  }
+  mapRuntime.markers = [];
+  try {
+    mapRuntime.map?.destroy?.();
+  } catch {
+    // ignore
+  }
+  mapRuntime.map = null;
+  mapRuntime.AMap = null;
+}
+
+/**
+ * 高德要求：在加载 https://webapi.amap.com/maps 脚本之前设置 window._AMapSecurityConfig。
+ * 参见 https://lbs.amap.com/api/javascript-api-v2/guide/abc/jscode
+ * - 生产推荐：Nginx 等代理 `/_AMapService` → restapi，query 带 jscode；此处只设 serviceHost。
+ * - 便捷开发：明文 securityJsCode（勿提交到公开仓库）。
+ */
+async function ensureAmapJsLoaded(settings) {
+  const key = (settings?.amapJsKey || "").trim();
+  if (!key) throw new Error("请先在设置中填写「高德 JS API Key」");
+  const serviceHost = (settings?.amapServiceHost || "").trim().replace(/\/+$/, "");
+  const sec = (settings?.amapSecurityCode || "").trim();
+  try {
+    delete globalThis._AMapSecurityConfig;
+  } catch {
+    globalThis._AMapSecurityConfig = undefined;
+  }
+  if (serviceHost) {
+    globalThis._AMapSecurityConfig = { serviceHost };
+    if (!/_AMapService$/i.test(serviceHost)) {
+      console.warn(
+        "[img_love] amapServiceHost 应以 /_AMapService 结尾（高德固定前缀）。示例：https://你的域名/_AMapService — 文档：https://lbs.amap.com/api/javascript-api-v2/guide/abc/jscode"
+      );
+    }
+  } else if (sec) {
+    globalThis._AMapSecurityConfig = { securityJsCode: sec };
+  } else {
+    console.warn(
+      "[img_love] 未配置 serviceHost 或 securityJsCode；2021-12-02 后申请的 JS API Key 可能无法加载地图。参见 https://lbs.amap.com/api/javascript-api-v2/guide/abc/jscode"
+    );
+  }
+  const src = `https://webapi.amap.com/maps?v=2.0&key=${encodeURIComponent(key)}&plugin=${encodeURIComponent(plugins)}`;
+  await loadScriptOnce(src);
+  if (!globalThis.AMap) throw new Error("高德 JS API 未就绪");
+  mapRuntime.AMap = globalThis.AMap;
+  return globalThis.AMap;
+}
+
+function collectFlatPoints(items, { city } = {}) {
+  const pts = [];
+  for (const it of items) {
+    ensureItemPlacesShape(it);
+    if (city && city !== "全部" && it.city !== city) continue;
+    for (const pl of it.places || []) {
+      const loc = parseLngLatStr(pl?.amap?.location);
+      if (!loc) continue;
+      const label = pl?.amap?.name || pl?.name || it.title || "地点";
+      const sub = pl?.amap?.address || [pl?.road, pl?.addressHint].filter(Boolean).join(" · ");
+      pts.push({
+        itemId: it.id,
+        placeId: pl.id,
+        city: it.city,
+        label,
+        sub,
+        lng: loc.lng,
+        lat: loc.lat,
+        tags: pl.categoryTags || [],
+        loc
+      });
+    }
+  }
+  return pts;
+}
+
+function orderPointsNearestNeighbor(points, startLngLat) {
+  if (!points.length) return [];
+  const rest = points.slice();
+  const out = [];
+  if (startLngLat) {
+    rest.sort((a, b) => (haversineMeters(startLngLat, a.loc) || 0) - (haversineMeters(startLngLat, b.loc) || 0));
+    out.push(rest.shift());
+  } else {
+    out.push(rest.shift());
+  }
+  let cur = out[0].loc;
+  while (rest.length) {
+    let bestI = 0;
+    let bestD = Infinity;
+    for (let i = 0; i < rest.length; i++) {
+      const d = haversineMeters(cur, rest[i].loc) ?? Infinity;
+      if (d < bestD) {
+        bestD = d;
+        bestI = i;
+      }
+    }
+    const next = rest.splice(bestI, 1)[0];
+    out.push(next);
+    cur = next.loc;
+  }
+  return out;
+}
+
+function collectPlaceRows(items, city) {
+  const rows = [];
+  for (const it of items) {
+    ensureItemPlacesShape(it);
+    if (city && city !== "全部" && it.city !== city) continue;
+    for (const pl of it.places || []) {
+      const loc = parseLngLatStr(pl?.amap?.location);
+      rows.push({
+        itemId: it.id,
+        placeId: pl.id,
+        itemTitle: it.title,
+        city: it.city,
+        label: pl?.amap?.name || pl?.name || "(未命名地点)",
+        sub: pl?.amap?.address || [pl?.district, pl?.road, pl?.addressHint].filter(Boolean).join(" · "),
+        tags: pl.categoryTags || [],
+        resolveStatus: pl.resolveStatus,
+        loc,
+        kw: buildPlaceSearchKeyword(it.city, pl)
+      });
+    }
+  }
+  return rows;
 }
 
 function loadImageFromFile(file) {
@@ -445,6 +855,12 @@ function buildAmapRouteUrl(keyword) {
   return `https://www.amap.com/dir?to=${q}`;
 }
 
+function buildAmapDirToLngLat(lng, lat, name) {
+  const base = `https://www.amap.com/dir?to=${encodeURIComponent(`${lng},${lat}`)}`;
+  if (name) return `${base}&toname=${encodeURIComponent(name)}`;
+  return base;
+}
+
 function buildDianpingSearchUrl(city, keyword) {
   const q = encodeURIComponent(`${city && city !== "未知" ? city + " " : ""}${keyword || ""}`.trim());
   return `https://www.dianping.com/search/keyword/0/0_${q}`;
@@ -566,7 +982,24 @@ const els = {
 
   itemTemplate: document.getElementById("itemTemplate"),
   editTemplate: document.getElementById("editTemplate"),
-  editDialog: document.getElementById("editDialog")
+  editDialog: document.getElementById("editDialog"),
+
+  btnMap: document.getElementById("btnMap"),
+  mapDialog: document.getElementById("mapDialog"),
+  mapClose: document.getElementById("mapClose"),
+  mapCitySelect: document.getElementById("mapCitySelect"),
+  mapContainer: document.getElementById("mapContainer"),
+  mapPointList: document.getElementById("mapPointList"),
+  mapLocate: document.getElementById("mapLocate"),
+  mapFit: document.getElementById("mapFit"),
+  mapClearRoute: document.getElementById("mapClearRoute"),
+  mapRouteOrder: document.getElementById("mapRouteOrder"),
+  mapRouteNN: document.getElementById("mapRouteNN"),
+  mapRouteMeta: document.getElementById("mapRouteMeta"),
+
+  amapJsKey: document.getElementById("amapJsKey"),
+  amapSecurityCode: document.getElementById("amapSecurityCode"),
+  amapServiceHost: document.getElementById("amapServiceHost")
 };
 
 let deferredPrompt = null;
@@ -601,6 +1034,12 @@ function renderInterestChips() {
   // include dynamic tags from items
   for (const it of state.items) {
     for (const tag of it.interests || []) all.add(tag);
+    ensureItemPlacesShape(it);
+    for (const pl of it.places || []) {
+      for (const t of pl.categoryTags || []) {
+        if (t) all.add(t);
+      }
+    }
   }
   for (const name of Array.from(all)) {
     const chip = document.createElement("div");
@@ -621,13 +1060,22 @@ function filterItems() {
   const q = (state.search || "").trim().toLowerCase();
 
   return state.items.filter((it) => {
+    ensureItemPlacesShape(it);
     if (city && city !== "全部" && it.city !== city) return false;
     if (interest && interest !== "全部") {
       const tags = it.interests || [];
-      if (!tags.includes(interest)) return false;
+      const placeTags = (it.places || []).flatMap((p) => p.categoryTags || []);
+      const merged = new Set([...tags, ...placeTags]);
+      if (!merged.has(interest)) return false;
     }
     if (q) {
-      const hay = `${it.title || ""}\n${it.text || ""}\n${it.city || ""}\n${(it.interests || []).join(",")}`.toLowerCase();
+      const placeBits = (it.places || [])
+        .map(
+          (p) =>
+            `${p?.name || ""}\n${p?.road || ""}\n${p?.addressHint || ""}\n${p?.note || ""}\n${(p?.amap?.name || "")}\n${(p?.amap?.address || "")}\n${(p?.categoryTags || []).join(",")}`
+        )
+        .join("\n");
+      const hay = `${it.title || ""}\n${it.text || ""}\n${it.city || ""}\n${(it.interests || []).join(",")}\n${placeBits}`.toLowerCase();
       if (!hay.includes(q)) return false;
     }
     return true;
@@ -693,18 +1141,83 @@ function renderItems() {
       img.alt = it.title || "截图";
       title.textContent = it.title || "未命名";
       meta.textContent = `${formatDate(it.createdAt)} · ${it.source || "截图"}`;
+      ensureItemPlacesShape(it);
       tags.innerHTML = "";
       tags.appendChild(createTag(it.city || "未知"));
       for (const tag of it.interests || []) tags.appendChild(createTag(tag));
       text.textContent = clampText(it.text || "", 220);
 
-      node.querySelector(".action-route").addEventListener("click", () => {
-        const keyword = it.title || it.poi || it.city || "目的地";
-        window.open(buildAmapRouteUrl(`${keyword}`), "_blank", "noopener,noreferrer");
-      });
-      node.querySelector(".action-dianping").addEventListener("click", () => {
-        const keyword = it.title || it.poi || "";
-        window.open(buildDianpingSearchUrl(it.city || state.settings.currentCity, keyword), "_blank", "noopener,noreferrer");
+      const placesWrap = node.querySelector(".places-wrap");
+      placesWrap.innerHTML = "";
+      for (const pl of it.places || []) {
+        const row = document.createElement("div");
+        row.className = "place-row";
+        const prowTop = document.createElement("div");
+        prowTop.className = "place-row-top";
+        const nameEl = document.createElement("div");
+        nameEl.className = "place-name";
+        nameEl.textContent = pl.amap?.name || pl.name || "(未命名地点)";
+        const st = document.createElement("div");
+        st.className = "place-status";
+        const stKey = pl.resolveStatus === "ok" ? "ok" : pl.resolveStatus === "fail" ? "fail" : pl.resolveStatus === "empty" ? "empty" : "pending";
+        st.dataset.st = stKey;
+        st.textContent =
+          pl.resolveStatus === "ok" ? "已定位" : pl.resolveStatus === "fail" ? "未匹配到POI" : pl.resolveStatus === "empty" ? "检索词不足" : "待解析";
+        prowTop.appendChild(nameEl);
+        prowTop.appendChild(st);
+        row.appendChild(prowTop);
+
+        const metaEl = document.createElement("div");
+        metaEl.className = "place-meta";
+        metaEl.textContent = [pl.amap?.address, pl.road, pl.addressHint, pl.note].filter(Boolean).join(" · ").slice(0, 220);
+        row.appendChild(metaEl);
+
+        const pt = document.createElement("div");
+        pt.className = "place-tags";
+        for (const t of pl.categoryTags || []) {
+          const span = document.createElement("span");
+          span.className = "place-tag";
+          span.textContent = t;
+          pt.appendChild(span);
+        }
+        row.appendChild(pt);
+
+        const pa = document.createElement("div");
+        pa.className = "place-actions";
+        const btnR = document.createElement("button");
+        btnR.type = "button";
+        btnR.className = "btn btn-ghost";
+        btnR.textContent = "路线";
+        btnR.addEventListener("click", () => {
+          const loc = parseLngLatStr(pl.amap?.location);
+          if (loc) window.open(buildAmapDirToLngLat(loc.lng, loc.lat, pl.amap?.name || pl.name), "_blank", "noopener,noreferrer");
+          else window.open(buildAmapRouteUrl(buildPlaceSearchKeyword(it.city, pl)), "_blank", "noopener,noreferrer");
+        });
+        const btnD = document.createElement("button");
+        btnD.type = "button";
+        btnD.className = "btn btn-ghost";
+        btnD.textContent = "点评";
+        btnD.addEventListener("click", () => {
+          const kw = pl.amap?.name || pl.name || it.title;
+          window.open(buildDianpingSearchUrl(it.city || state.settings.currentCity, kw), "_blank", "noopener,noreferrer");
+        });
+        pa.appendChild(btnR);
+        pa.appendChild(btnD);
+        row.appendChild(pa);
+        placesWrap.appendChild(row);
+      }
+
+      node.querySelector(".action-map-item").addEventListener("click", () => openMapExplorer({ focusItemId: it.id }));
+      node.querySelector(".action-reresolve").addEventListener("click", async () => {
+        ensureItemPlacesShape(it);
+        for (const p of it.places) {
+          const kw = buildPlaceSearchKeyword(it.city, p);
+          p.resolveStatus = kw ? "pending" : "empty";
+          p.amap = null;
+        }
+        await resolvePlacesAmap(it);
+        await putItem(it);
+        await refresh();
       });
       node.querySelector(".action-delete").addEventListener("click", async () => {
         if (!confirm("确定删除这条收藏吗？")) return;
@@ -738,6 +1251,12 @@ function render() {
 
 async function refresh() {
   state.items = await listItems();
+  for (const it of state.items) {
+    if (!Array.isArray(it.places) || it.places.length === 0) {
+      ensureItemPlacesShape(it);
+      await putItem(it);
+    }
+  }
   render();
 }
 
@@ -824,7 +1343,6 @@ async function importFiles(files) {
     let address = "";
     let title = guessTitleFromText(text);
 
-    // Apply AI fields (from /api/vision)
     if (typeof ai?.title === "string" && ai.title.trim()) title = ai.title.trim();
     if (typeof ai?.city === "string" && ai.city.trim()) city = ai.city.trim();
     if (Array.isArray(ai?.interests) && ai.interests.length) interests = ai.interests;
@@ -833,7 +1351,15 @@ async function importFiles(files) {
 
     if (!interests?.length) interests = ["未分类"];
     if (!city) city = "未知";
-    const primaryInterest = interests?.[0] || "未分类";
+
+    const hintCity = state.settings.currentCity && state.settings.currentCity !== "全部" ? state.settings.currentCity : city;
+    const { city: parsedCity, places } = placesFromVisionPayload(ai, hintCity);
+    city = parsedCity || city;
+
+    const primaryInterest =
+      (places[0]?.categoryTags?.[0] && places[0].categoryTags[0] !== "未分类" ? places[0].categoryTags[0] : null) ||
+      interests?.[0] ||
+      "未分类";
 
     const item = {
       id: uid(),
@@ -845,11 +1371,19 @@ async function importFiles(files) {
       primaryInterest,
       poi,
       address,
+      places,
       aiConfidence: typeof ai?.confidence === "number" ? ai.confidence : 0,
       source: "截图",
       imageDataUrl,
       imageHash
     };
+
+    setProgress("高德对齐坐标", idx + 1, list.length);
+    try {
+      await resolvePlacesAmap(item);
+    } catch {
+      // 保留条目，子点标记为 fail / pending
+    }
 
     await putItem(item);
     if (imageHash) await kvSet(`imgHash:${imageHash}`, item.id);
@@ -862,13 +1396,266 @@ async function importFiles(files) {
   }
 }
 
+let mapExplorerFocusItemId = null;
+
+function getMapFilterCity() {
+  const v = els.mapCitySelect?.value;
+  return v || state.settings.currentCity || "全部";
+}
+
+function renderMapCitySelectOptions() {
+  if (!els.mapCitySelect) return;
+  const set = new Set(CITY_CANDIDATES.filter((c) => c !== "全部"));
+  for (const it of state.items) {
+    if (it.city) set.add(it.city);
+  }
+  const cities = ["全部", ...Array.from(set)];
+  els.mapCitySelect.innerHTML = "";
+  const preferred = mapExplorerFocusItemId
+    ? state.items.find((x) => x.id === mapExplorerFocusItemId)?.city
+    : state.settings.currentCity;
+  for (const c of cities) {
+    const opt = document.createElement("option");
+    opt.value = c;
+    opt.textContent = c;
+    els.mapCitySelect.appendChild(opt);
+  }
+  if (preferred && cities.includes(preferred)) els.mapCitySelect.value = preferred;
+  else if (state.settings.currentCity && cities.includes(state.settings.currentCity)) els.mapCitySelect.value = state.settings.currentCity;
+  else els.mapCitySelect.value = "全部";
+}
+
+function destroyRouteOverlay() {
+  try {
+    mapRuntime.polyline?.setMap?.(null);
+  } catch {
+    // ignore
+  }
+  mapRuntime.polyline = null;
+}
+
+function renderMapSidebarList() {
+  if (!els.mapPointList) return;
+  const c = getMapFilterCity();
+  const rows = collectPlaceRows(state.items, c);
+  els.mapPointList.innerHTML = "";
+  const user = mapRuntime.userLngLat;
+  for (const r of rows) {
+    const row = document.createElement("label");
+    row.className = "map-point-row";
+    row.dataset.itemId = r.itemId;
+    row.dataset.placeId = r.placeId;
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.disabled = !r.loc;
+    const main = document.createElement("div");
+    main.className = "map-point-main";
+    const t = document.createElement("div");
+    t.className = "map-point-title";
+    t.textContent = r.label;
+    const s = document.createElement("div");
+    s.className = "map-point-sub";
+    s.textContent = [r.city, r.sub].filter(Boolean).join(" · ");
+    main.appendChild(t);
+    main.appendChild(s);
+    if (user && r.loc) {
+      const d = document.createElement("div");
+      d.className = "map-point-dist";
+      const m = haversineMeters(user, r.loc);
+      d.textContent = m != null ? `距我约 ${formatDistanceM(m)}` : "";
+      main.appendChild(d);
+    }
+    row.appendChild(cb);
+    row.appendChild(main);
+    els.mapPointList.appendChild(row);
+  }
+}
+
+function rebuildMapMarkers() {
+  const AMap = mapRuntime.AMap;
+  const map = mapRuntime.map;
+  if (!AMap || !map) return;
+  try {
+    mapRuntime.cluster?.setMap?.(null);
+  } catch {
+    // ignore
+  }
+  mapRuntime.cluster = null;
+  for (const m of mapRuntime.markers) {
+    try {
+      m.setMap(null);
+    } catch {
+      // ignore
+    }
+  }
+  mapRuntime.markers = [];
+
+  const c = getMapFilterCity();
+  const cityArg = c === "全部" ? "" : c;
+  let pts = collectFlatPoints(state.items, { city: cityArg });
+  if (mapExplorerFocusItemId) {
+    pts = pts.filter((p) => p.itemId === mapExplorerFocusItemId);
+  }
+  if (!pts.length) {
+    map.setZoomAndCenter(11, [104.065735, 30.659462]);
+    return;
+  }
+  const markers = pts.map(
+    (p) =>
+      new AMap.Marker({
+        position: [p.lng, p.lat],
+        title: p.label,
+        extData: { ...p }
+      })
+  );
+  mapRuntime.markers = markers;
+  AMap.plugin(["AMap.MarkerCluster"], () => {
+    try {
+      mapRuntime.cluster = new AMap.MarkerCluster(map, markers, { gridSize: 70, maxZoom: 18 });
+    } catch {
+      for (const m of markers) m.setMap(map);
+    }
+    try {
+      map.setFitView(markers, false, [56, 56, 56, 320]);
+    } catch {
+      // ignore
+    }
+  });
+}
+
+async function initMapPanel() {
+  if (!els.mapContainer) throw new Error("地图容器未找到");
+  destroyMapRuntime();
+  els.mapContainer.innerHTML = "";
+  const AMap = await ensureAmapJsLoaded(state.settings);
+  mapRuntime.map = new AMap.Map(els.mapContainer, {
+    zoom: 11,
+    viewMode: "2D"
+  });
+  mapRuntime.map.addControl(new AMap.Scale());
+  mapRuntime.map.addControl(new AMap.ToolBar({ liteStyle: true }));
+  rebuildMapMarkers();
+  renderMapSidebarList();
+}
+
+async function openMapExplorer(opts = {}) {
+  mapExplorerFocusItemId = opts.focusItemId || null;
+  if (!els.mapDialog) return;
+  renderMapCitySelectOptions();
+  if (els.mapRouteMeta) els.mapRouteMeta.textContent = "";
+  els.mapDialog.showModal();
+  try {
+    await initMapPanel();
+  } catch (e) {
+    alert(String(e?.message || e));
+  }
+}
+
+function getCheckedRoutePointsInDomOrder() {
+  const out = [];
+  const nodes = els.mapPointList?.querySelectorAll(".map-point-row") || [];
+  for (const row of nodes) {
+    const cb = row.querySelector('input[type="checkbox"]');
+    if (!cb?.checked) continue;
+    const itemId = row.dataset.itemId;
+    const placeId = row.dataset.placeId;
+    const it = state.items.find((x) => x.id === itemId);
+    if (!it) continue;
+    ensureItemPlacesShape(it);
+    const pl = (it.places || []).find((p) => p.id === placeId);
+    const loc = parseLngLatStr(pl?.amap?.location);
+    if (!loc) continue;
+    out.push({
+      itemId,
+      placeId,
+      lng: loc.lng,
+      lat: loc.lat,
+      loc,
+      label: pl?.amap?.name || pl?.name || ""
+    });
+  }
+  return out;
+}
+
+async function runMapDrivingRoute(useNN) {
+  if (els.mapRouteMeta) els.mapRouteMeta.textContent = "";
+  let pts = getCheckedRoutePointsInDomOrder();
+  if (pts.length < 2) {
+    alert("请至少勾选 2 个已定位的兴趣点。");
+    return;
+  }
+  const midMax = 16;
+  if (pts.length - 2 > midMax) {
+    alert(`途经点过多：驾车接口途经点最多 ${midMax} 个，请减少勾选。`);
+    return;
+  }
+  if (useNN && mapRuntime.userLngLat) {
+    pts = orderPointsNearestNeighbor(pts, mapRuntime.userLngLat);
+  } else if (useNN) {
+    pts = orderPointsNearestNeighbor(pts, null);
+  }
+  const origin = `${pts[0].lng},${pts[0].lat}`;
+  const destination = `${pts[pts.length - 1].lng},${pts[pts.length - 1].lat}`;
+  let waypoints = "";
+  if (pts.length > 2) {
+    waypoints = pts
+      .slice(1, -1)
+      .map((p) => `${p.lng},${p.lat}`)
+      .join("|");
+  }
+  try {
+    const data = await amapRest({
+      action: "routeDriving",
+      origin,
+      destination,
+      ...(waypoints ? { waypoints } : {})
+    });
+    if (!data?.ok || !Array.isArray(data.path) || data.path.length < 2) {
+      if (els.mapRouteMeta) els.mapRouteMeta.textContent = "路线规划无有效路径，请尝试减少点数或检查坐标。";
+      return;
+    }
+    destroyRouteOverlay();
+    const AMap = mapRuntime.AMap;
+    const pathArr = data.path.map((p) => [p.lng, p.lat]);
+    mapRuntime.polyline = new AMap.Polyline({
+      path: pathArr,
+      strokeColor: "#4F8CFF",
+      strokeWeight: 6,
+      strokeOpacity: 0.92,
+      lineJoin: "round",
+      lineCap: "round"
+    });
+    mapRuntime.map.add(mapRuntime.polyline);
+    try {
+      mapRuntime.map.setFitView([mapRuntime.polyline], false, [72, 72, 72, 360]);
+    } catch {
+      // ignore
+    }
+    const km = (Number(data.distance) / 1000).toFixed(1);
+    const min = Math.round(Number(data.duration) / 60);
+    if (els.mapRouteMeta) {
+      els.mapRouteMeta.textContent = `驾车约 ${km} km，预估 ${min} 分钟（仅供参考，以高德实时导航为准）。`;
+    }
+  } catch (e) {
+    alert(`路线规划失败：${String(e?.message || e)}`);
+  }
+}
+
 function openEditDialog(item) {
   els.editDialog.innerHTML = "";
   const form = els.editTemplate.content.firstElementChild.cloneNode(true);
+  ensureItemPlacesShape(item);
   form.city.value = item.city || "";
   form.interests.value = (item.interests || []).join(", ");
   form.title.value = item.title || "";
   form.text.value = item.text || "";
+  if (form.placesJson) {
+    try {
+      form.placesJson.value = JSON.stringify(item.places || [], null, 2);
+    } catch {
+      form.placesJson.value = "";
+    }
+  }
 
   form.addEventListener("close", () => {});
 
@@ -881,14 +1668,39 @@ function openEditDialog(item) {
       .filter(Boolean);
     const title = (form.title.value || "").trim() || "未命名";
     const text = form.text.value || "";
-
+    let places = item.places;
+    if (form.placesJson) {
+      const raw = (form.placesJson.value || "").trim();
+      if (raw) {
+        try {
+          const parsed = JSON.parse(raw);
+          if (!Array.isArray(parsed)) throw new Error("地点需为 JSON 数组");
+          places = parsed.map((p) => ({
+            id: typeof p?.id === "string" && p.id ? p.id : uid(),
+            categoryTags: Array.isArray(p?.categoryTags) ? p.categoryTags.map((x) => String(x).trim()).filter(Boolean) : ["未分类"],
+            name: typeof p?.name === "string" ? p.name : "",
+            road: typeof p?.road === "string" ? p.road : "",
+            district: typeof p?.district === "string" ? p.district : "",
+            addressHint: typeof p?.addressHint === "string" ? p.addressHint : "",
+            note: typeof p?.note === "string" ? p.note : "",
+            rawQuote: typeof p?.rawQuote === "string" ? p.rawQuote : "",
+            amap: p?.amap && typeof p.amap === "object" ? p.amap : null,
+            resolveStatus: typeof p?.resolveStatus === "string" ? p.resolveStatus : "pending"
+          }));
+        } catch (err) {
+          alert(`地点 JSON 无效：${String(err?.message || err)}`);
+          return;
+        }
+      }
+    }
     await putItem({
       ...item,
       city,
       interests: interests.length ? interests : ["未分类"],
       primaryInterest: interests[0] || item.primaryInterest || "未分类",
       title,
-      text
+      text,
+      places
     });
     els.editDialog.close();
     await refresh();
@@ -911,10 +1723,26 @@ async function inferCityFromGeolocation() {
       navigator.geolocation.getCurrentPosition(resolve, reject, { enableHighAccuracy: false, timeout: 8000 });
     });
     const { latitude, longitude } = pos.coords;
-    // Without calling external APIs (to keep mainland access + privacy),
-    // we can't reverse geocode to city reliably. So we just open AMap and suggest.
-    window.open(`https://www.amap.com/regeo?lnglat=${longitude},${latitude}`, "_blank", "noopener,noreferrer");
-    alert("我已在新页面打开高德的逆地理入口。你可以查看城市后在这里手动选择。下一阶段可接入高德逆地理 API 自动回填。");
+    let filled = false;
+    try {
+      const data = await amapRest({ action: "regeo", location: `${longitude},${latitude}` });
+      if (data?.ok && data.city) {
+        let c = String(data.city).replace(/市$/u, "").trim();
+        if (c && c !== "未知") {
+          state.settings.currentCity = c;
+          await setSettings(state.settings);
+          renderCitySelect();
+          render();
+          filled = true;
+        }
+      }
+    } catch {
+      // ignore
+    }
+    if (!filled) {
+      window.open(`https://www.amap.com/regeo?lnglat=${longitude},${latitude}`, "_blank", "noopener,noreferrer");
+      alert("已尝试用高德逆地理解析城市；若失败已打开地图页。也可在「当前城市」里手动选择。");
+    }
   } catch {
     alert("定位失败。请检查浏览器权限或网络。");
   } finally {
@@ -957,13 +1785,19 @@ async function boot() {
   renderCitySelect();
   els.ocrLang.value = state.settings.ocrLang;
   els.classifierMode.value = state.settings.classifierMode;
+  if (els.amapJsKey) els.amapJsKey.value = state.settings.amapJsKey || "";
+  if (els.amapSecurityCode) els.amapSecurityCode.value = state.settings.amapSecurityCode || "";
+  if (els.amapServiceHost) els.amapServiceHost.value = state.settings.amapServiceHost || "";
 
   els.btnSettings.addEventListener("click", () => els.settingsDialog.showModal());
   els.btnSaveSettings.addEventListener("click", async () => {
     const next = {
       ...state.settings,
       ocrLang: els.ocrLang.value,
-      classifierMode: els.classifierMode.value
+      classifierMode: els.classifierMode.value,
+      amapJsKey: (els.amapJsKey?.value || "").trim(),
+      amapSecurityCode: (els.amapSecurityCode?.value || "").trim(),
+      amapServiceHost: (els.amapServiceHost?.value || "").trim()
     };
     state.settings = next;
     await setSettings(next);
@@ -997,8 +1831,63 @@ async function boot() {
     els.searchInput.value = "";
     els.ocrLang.value = state.settings.ocrLang;
     els.classifierMode.value = state.settings.classifierMode;
+    if (els.amapJsKey) els.amapJsKey.value = "";
+    if (els.amapSecurityCode) els.amapSecurityCode.value = "";
+    if (els.amapServiceHost) els.amapServiceHost.value = "";
     await refresh();
   });
+
+  if (els.btnMap) els.btnMap.addEventListener("click", () => openMapExplorer({}));
+  if (els.mapClose) els.mapClose.addEventListener("click", () => els.mapDialog?.close());
+  if (els.mapDialog) {
+    els.mapDialog.addEventListener("close", () => {
+      mapExplorerFocusItemId = null;
+      destroyMapRuntime();
+    });
+  }
+  if (els.mapCitySelect) {
+    els.mapCitySelect.addEventListener("change", () => {
+      destroyRouteOverlay();
+      rebuildMapMarkers();
+      renderMapSidebarList();
+    });
+  }
+  if (els.mapFit) {
+    els.mapFit.addEventListener("click", () => {
+      try {
+        mapRuntime.map?.setFitView?.(mapRuntime.markers, false, [56, 56, 56, 320]);
+      } catch {
+        // ignore
+      }
+    });
+  }
+  if (els.mapClearRoute) els.mapClearRoute.addEventListener("click", () => destroyRouteOverlay());
+  if (els.mapRouteOrder) els.mapRouteOrder.addEventListener("click", () => runMapDrivingRoute(false));
+  if (els.mapRouteNN) els.mapRouteNN.addEventListener("click", () => runMapDrivingRoute(true));
+  if (els.mapLocate) {
+    els.mapLocate.addEventListener("click", () => {
+      const AMap = mapRuntime.AMap;
+      const map = mapRuntime.map;
+      if (!AMap || !map) {
+        alert("请先打开地图并等待加载完成。");
+        return;
+      }
+      const geo = new AMap.Geolocation({
+        enableHighAccuracy: true,
+        timeout: 15000,
+        needAddress: false
+      });
+      geo.getCurrentPosition((status, res) => {
+        if (status !== "complete" || !res?.position) {
+          alert("定位失败，请检查浏览器定位权限。");
+          return;
+        }
+        mapRuntime.userLngLat = { lng: res.position.lng, lat: res.position.lat };
+        map.setCenter([res.position.lng, res.position.lat]);
+        renderMapSidebarList();
+      });
+    });
+  }
 
   await refresh();
 }

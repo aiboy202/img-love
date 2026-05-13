@@ -146,14 +146,10 @@ export default async function onRequest(context) {
     "给定一段 OCR 文本（来自用户截图），抽取结构化字段用于个人收藏归档。",
     "必须只输出 JSON（不要 Markdown，不要解释）。",
     "JSON 结构固定为：",
-    '{ "title": string, "city": string, "interests": string[], "poi": string, "address": string, "confidence": number }',
-    "规则：",
-    "- title：尽量短（<=26字），能代表该条收藏的核心对象（店名/景点/事件）。",
-    "- city：尽量从文本中判断；如果没有把握填“未知”。",
-    "- interests：从文本语义判断 1~3 个标签；没有把握返回 [\"未分类\"]。",
-    "- poi：店名/景点名（可为空字符串）。",
-    "- address：地址（可为空字符串）。",
-    "- confidence：0~1 的整体置信度。"
+    '{ "title": string, "city": string, "interests": string[], "confidence": number, "places": Place[] }',
+    "Place = { categoryTags[], name, road, district, addressHint, note, rawQuote }（字段均可为空字符串或空数组）。",
+    "places 必须列出文本中**每一个**独立地点/门店/景点；多店多路要拆成多个元素。",
+    "interests 为全文层面的 1~4 个标签；categoryTags 为单点类型标签。"
   ].join("\n");
 
   const user = `OCR文本如下（可能有错别字/换行）：\n${text}\n`;
@@ -213,18 +209,65 @@ export default async function onRequest(context) {
     return json({ error: "Model output is not valid JSON", model, content }, { status: 502 });
   }
 
+  let city = typeof parsed.city === "string" ? parsed.city.trim().slice(0, 12) : "未知";
+  if (!city) city = "未知";
+
+  let interests = Array.isArray(parsed.interests)
+    ? parsed.interests.map((x) => String(x).trim()).filter(Boolean).slice(0, 6)
+    : ["未分类"];
+  if (!interests.length) interests = ["未分类"];
+
+  const confidence = typeof parsed.confidence === "number" ? Math.max(0, Math.min(1, parsed.confidence)) : 0;
+
+  let places = Array.isArray(parsed.places) ? parsed.places : [];
+  places = places
+    .filter((p) => p && typeof p === "object")
+    .map((p) => {
+      const categoryTags = Array.isArray(p.categoryTags)
+        ? p.categoryTags.map((x) => String(x).trim()).filter(Boolean).slice(0, 6)
+        : [];
+      return {
+        categoryTags,
+        name: typeof p.name === "string" ? p.name.trim().slice(0, 80) : "",
+        road: typeof p.road === "string" ? p.road.trim().slice(0, 60) : "",
+        district: typeof p.district === "string" ? p.district.trim().slice(0, 40) : "",
+        addressHint: typeof p.addressHint === "string" ? p.addressHint.trim().slice(0, 120) : "",
+        note: typeof p.note === "string" ? p.note.trim().slice(0, 120) : "",
+        rawQuote: typeof p.rawQuote === "string" ? p.rawQuote.trim().slice(0, 120) : ""
+      };
+    })
+    .slice(0, 24);
+
+  const legacyPoi = typeof parsed.poi === "string" ? parsed.poi.trim().slice(0, 80) : "";
+  const legacyAddress = typeof parsed.address === "string" ? parsed.address.trim().slice(0, 120) : "";
+  const title = typeof parsed.title === "string" ? parsed.title.trim().slice(0, 40) : "";
+
+  if (!places.length) {
+    places.push({
+      categoryTags: interests.filter((x) => x && x !== "未分类").length ? interests.slice(0, 4) : ["未分类"],
+      name: legacyPoi || title,
+      road: "",
+      district: "",
+      addressHint: legacyAddress,
+      note: "",
+      rawQuote: ""
+    });
+  }
+
+  const tagSet = new Set(interests);
+  for (const pl of places) for (const t of pl.categoryTags) if (t) tagSet.add(t);
+  interests = Array.from(tagSet).slice(0, 8);
+  if (!interests.length) interests = ["未分类"];
+
   const out = {
-    title: typeof parsed.title === "string" ? parsed.title.trim().slice(0, 40) : "",
-    city: typeof parsed.city === "string" ? parsed.city.trim().slice(0, 12) : "未知",
-    interests: Array.isArray(parsed.interests)
-      ? parsed.interests.map((x) => String(x).trim()).filter(Boolean).slice(0, 5)
-      : ["未分类"],
-    poi: typeof parsed.poi === "string" ? parsed.poi.trim().slice(0, 40) : "",
-    address: typeof parsed.address === "string" ? parsed.address.trim().slice(0, 80) : "",
-    confidence: typeof parsed.confidence === "number" ? Math.max(0, Math.min(1, parsed.confidence)) : 0
+    title: title || (places[0]?.name ? String(places[0].name).slice(0, 40) : "文本收藏"),
+    city,
+    interests,
+    confidence,
+    places,
+    poi: legacyPoi || (typeof places[0]?.name === "string" ? places[0].name : ""),
+    address: legacyAddress || (typeof places[0]?.addressHint === "string" ? places[0].addressHint : "")
   };
-  if (!out.interests.length) out.interests = ["未分类"];
-  if (!out.city) out.city = "未知";
 
   return json(out);
 }

@@ -24,6 +24,7 @@
         </div>
       </div>
       <div class="topbar-actions">
+        <button id="btnMap" class="btn btn-primary" type="button">地图</button>
         <button id="btnInstall" class="btn btn-ghost" hidden>添加到主屏幕</button>
         <button id="btnSettings" class="btn btn-ghost" title="设置">设置</button>
       </div>
@@ -89,20 +90,76 @@
       </section>
 
       <section class="card">
-        <div class="section-title">集成入口（第一阶段）</div>
+        <div class="section-title">地图与路线</div>
         <div class="muted">
-          先用“跳转链接”的方式集成路线/点评。后续可以接入高德 Web JS SDK（需 Key）或更深的 POI 解析。
+          方案 A：按城市在地图上聚合展示已解析坐标，查看与当前位置距离，点选导航。方案 B：勾选多个兴趣点，按顺序或「最近邻」生成驾车路线（依赖后端高德 Web 服务 Key）。
         </div>
-        <div class="integration">
+        <div class="integration" style="margin-top: 12px">
           <div class="integration-item">
-            <div class="integration-title">路线（高德）</div>
-            <div class="integration-desc">在每条收藏里，点击“路线”会打开高德并带上关键字搜索/导航。</div>
+            <div class="integration-title">高德（前端地图）</div>
+            <div class="integration-desc">
+              JS API Key +（<code>securityJsCode</code> 明文 或 <code>serviceHost</code> 代理，二选一）。代理方式见
+              <a href="https://lbs.amap.com/api/javascript-api-v2/guide/abc/jscode" target="_blank" rel="noopener noreferrer">官方说明</a>；应用会在加载 <code>webapi.amap.com/maps</code> 之前设置 <code>window._AMapSecurityConfig</code>。
+            </div>
           </div>
           <div class="integration-item">
-            <div class="integration-title">点评（大众点评）</div>
-            <div class="integration-desc">在每条收藏里，点击“点评”会打开大众点评搜索页（城市+关键字）。</div>
+            <div class="integration-title">高德（后端 Web 服务）</div>
+            <div class="integration-desc">
+              服务端环境变量 <code>AMAP_REST_KEY</code>，由本项目 <code>/api/amap</code> 代理调用检索与驾车路径（Key 不下发浏览器）。静态页与 API 不同域时，用下方「网关说明」配置 <code>AMAP_API_URL</code>。
+            </div>
           </div>
         </div>
+        <details class="gateway-details">
+          <summary>网关与 <code>AMAP_API_URL</code> 配置说明</summary>
+          <div class="gateway-body muted">
+            <p class="gateway-warn">
+              <strong>常见误解：</strong>不需要把你的网站挂到 <code>*.amap.com</code> 子域名。<code>/api/amap</code> 是<strong>你自己站点上的 HTTP 路径</strong>，由部署平台（Functions / 网关 / Nginx）把请求转给服务端代码；不是高德服务器上的目录，也不是
+              <a href="https://lbs.amap.com/api/javascript-api-v2/summary" target="_blank" rel="noopener noreferrer">地图 JS API 2.0 概述</a>
+              里那种「在浏览器里加载 webapi.amap.com 画地图」的同一件事。
+            </p>
+            <p><strong>若直觉「同域访问不了 /api/amap」</strong></p>
+            <p>
+              若你当前是<strong>纯静态托管</strong>（例如本机 <code>python -m http.server</code>、只上传静态文件到 OSS/CDN、没有配置任何「无服务器函数 / 反向代理」），则浏览器访问
+              <code>/api/amap</code> 会 <strong>404</strong> —— 因为没有任何程序在监听这个路径。此时要么：① 把整站（含
+              <code>edge-functions</code>）部署到支持 Pages Functions / 类似能力的平台并配置 <code>AMAP_REST_KEY</code>；② 在
+              <code>AMAP_API_URL</code> 里填写<strong>已经部署好的</strong>另一套接口完整地址；③ 用 Nginx 把 <code>/api/amap</code> 反代到你的云函数。
+            </p>
+            <p><strong>1. 本项目的 <code>/api/amap</code>（与高德 <code>/_AMapService</code> 无关）</strong></p>
+            <p>
+              这是<strong>你自己部署的 HTTP 接口</strong>：浏览器 <code>POST</code> JSON（如 <code>action: resolvePlaces</code>），服务端用
+              <code>AMAP_REST_KEY</code> 访问 <code>https://restapi.amap.com</code>。仓库内实现为
+              <code>edge-functions/api/amap.js</code>，映射路径一般为 <code>/api/amap</code>。
+            </p>
+            <p><strong>2. EdgeOne / Pages Functions</strong></p>
+            <p>将静态站点与 Functions 同域部署时，<code>index.html</code> 里 <code>AMAP_API_URL</code> 可留空，前端使用相对路径 <code>/api/amap</code>。环境变量中配置 <code>AMAP_REST_KEY</code>。</p>
+            <p><strong>3. 腾讯云 API 网关 + 云函数</strong></p>
+            <ul>
+              <li>新增路由：<code>POST /api/amap</code>（或自定义路径，则须把 <code>AMAP_API_URL</code> 设为<strong>完整 URL</strong>）。</li>
+              <li>开启 CORS：<code>OPTIONS</code> 预检、响应头 <code>Access-Control-Allow-Origin</code>（可为静态页来源或 <code>*</code>）。</li>
+              <li>502/404 的<strong>错误响应</strong>也需带 CORS 头，否则浏览器只显示「Failed to fetch」。</li>
+            </ul>
+            <p><strong>4. <code>globalThis.__APP_CONFIG__.AMAP_API_URL</code></strong></p>
+            <ul>
+              <li>留空：请求同域 <code>/api/amap</code>。</li>
+              <li><code>https://api.example.com</code>：自动请求 <code>https://api.example.com/api/amap</code>。</li>
+              <li>已含路径的绝对地址（如网关发布的完整 URL）：按原样使用，不自动追加。</li>
+              <li><code>*.tencentscf.com</code> 且 URL 无路径：视为函数根 URL，不追加 <code>/api/amap</code>（若云函数未实现本接口，请改为带路径的完整 URL 或单独部署 amap 函数）。</li>
+            </ul>
+            <p><strong>5. 高德官方：JS API 的 <code>/_AMapService</code> 代理（地图瓦片 / Web 服务走代理）</strong></p>
+            <p>
+              这是给 <code>_AMapSecurityConfig.serviceHost</code> 用的<strong>另一套</strong> Nginx 规则，用于把浏览器对高德的请求经你的域名转发并附带
+              <code>jscode</code>。示例（摘自官方文档，请把「你的安全密钥」换成控制台里的值）：
+            </p>
+            <pre class="gateway-pre">location /_AMapService/ {
+  set $args "$args&amp;jscode=你的安全密钥";
+  proxy_pass https://restapi.amap.com/;
+}</pre>
+            <p>
+              然后在「设置」中填写 <strong>JS API 代理 serviceHost</strong> 为 <code>https://你的域名/_AMapService</code>。官方文档：
+              <a href="https://lbs.amap.com/api/javascript-api-v2/guide/abc/jscode" target="_blank" rel="noopener noreferrer">JS API 安全密钥使用</a>。
+            </p>
+          </div>
+        </details>
       </section>
     </main>
 
@@ -123,6 +180,25 @@
             <option value="rules">本地关键词规则（默认）</option>
             <option value="manual">仅手动（不自动打标签）</option>
           </select>
+        </div>
+        <div class="field">
+          <label>高德 JS API Key（地图展示）</label>
+          <input id="amapJsKey" class="input" type="password" autocomplete="off" placeholder="在控制台创建「Web端(JS API)」Key" />
+          <div class="hint">用于「地图」弹窗。与后端 <code>AMAP_REST_KEY</code>（Web 服务）不是同一个 Key。</div>
+        </div>
+        <div class="field">
+          <label>JS API 代理 serviceHost（可选，生产推荐）</label>
+          <input id="amapServiceHost" class="input" type="text" autocomplete="off" placeholder="https://你的域名/_AMapService" />
+          <div class="hint">
+            按高德
+            <a href="https://lbs.amap.com/api/javascript-api-v2/guide/abc/jscode" target="_blank" rel="noopener noreferrer">安全密钥文档</a>
+            ：用 Nginx 等把路径 <code>/_AMapService</code> 代理到 <code>restapi.amap.com</code> 并在查询串追加 <code>jscode=安全密钥</code> 后，把此处填为「你的站点 + /_AMapService」（无末尾斜杠）。填写后<strong>不必</strong>再把 securityJsCode 明文写进浏览器。
+          </div>
+        </div>
+        <div class="field">
+          <label>高德安全密钥 securityJsCode（与上项二选一）</label>
+          <input id="amapSecurityCode" class="input" type="password" autocomplete="off" placeholder="未配置代理时填写，须在加载地图脚本前注入" />
+          <div class="hint">2021-12-02 后申请的 JS API Key 通常必须配合安全密钥或 serviceHost 代理其一。已填 serviceHost 时可留空。</div>
         </div>
         <div class="field">
           <label>隐私</label>
@@ -147,11 +223,12 @@
           </div>
           <div class="tags"></div>
           <div class="item-text muted"></div>
+          <div class="places-wrap"></div>
           <div class="row row-wrap row-gap">
-            <button class="btn btn-ghost action-route">路线</button>
-            <button class="btn btn-ghost action-dianping">点评</button>
-            <button class="btn btn-ghost action-edit">编辑</button>
-            <button class="btn btn-ghost action-delete">删除</button>
+            <button class="btn btn-ghost action-map-item" type="button">地图</button>
+            <button class="btn btn-ghost action-reresolve" type="button">重解析坐标</button>
+            <button class="btn btn-ghost action-edit" type="button">编辑</button>
+            <button class="btn btn-ghost action-delete" type="button">删除</button>
           </div>
         </div>
       </article>
@@ -176,6 +253,11 @@
           <label>OCR 文本（可编辑）</label>
           <textarea name="text" class="textarea" rows="8"></textarea>
         </div>
+        <div class="field">
+          <label>地点列表（JSON 数组，高级）</label>
+          <textarea name="placesJson" class="textarea" rows="10" placeholder='[{"id":"…","categoryTags":["美食餐厅"],"name":"店名","road":"","district":"","addressHint":"","note":"","rawQuote":"","amap":null,"resolveStatus":"pending"}]'></textarea>
+          <div class="hint">保存后写回子地点；不确定请勿改。可用条目上「重解析坐标」刷新高德对齐结果。</div>
+        </div>
         <div class="row row-between row-gap">
           <button class="btn btn-ghost" value="cancel">取消</button>
           <button class="btn btn-primary" value="default">保存</button>
@@ -185,12 +267,49 @@
 
     <dialog id="editDialog" class="dialog"></dialog>
 
+    <dialog id="mapDialog" class="dialog map-dialog">
+      <div class="map-shell">
+        <div class="map-toolbar">
+          <div class="map-toolbar-title">地图 · 兴趣点</div>
+          <button id="mapClose" class="btn btn-ghost" type="button">关闭</button>
+        </div>
+        <div class="map-toolbar2 row row-wrap row-gap">
+          <div class="field" style="min-width: 140px; flex: 0">
+            <label>城市</label>
+            <select id="mapCitySelect" class="select"></select>
+          </div>
+          <button id="mapLocate" class="btn btn-ghost" type="button">定位我</button>
+          <button id="mapFit" class="btn btn-ghost" type="button">全览标点</button>
+          <button id="mapClearRoute" class="btn btn-ghost" type="button">清除路线</button>
+        </div>
+        <div class="map-split">
+          <div id="mapContainer" class="map-canvas"></div>
+          <aside class="map-side">
+            <div class="map-side-head muted">列表（有坐标可选中参与驾车规划，最多 16 个途经段）</div>
+            <div id="mapPointList" class="map-point-list"></div>
+            <div class="map-route-actions row row-wrap row-gap">
+              <button id="mapRouteOrder" class="btn btn-primary" type="button">按勾选顺序规划</button>
+              <button id="mapRouteNN" class="btn btn-primary" type="button">勾选点最近邻优化</button>
+            </div>
+            <div id="mapRouteMeta" class="muted map-route-meta"></div>
+          </aside>
+        </div>
+      </div>
+    </dialog>
+
     <!-- Use non-module CDN scripts for maximum mobile compatibility -->
     <script src="https://cdn.jsdelivr.net/npm/idb@8/build/iife/index-min.js"></script>
     <script>
-      // Runtime config：腾讯云函数 URL（*.tencentscf.com）填根地址即可；API 网关可填带路径的完整 URL
+      /*
+       * AMAP_API_URL：浏览器访问「本项目自建的高德 Web 服务代理」的基地址（不是高德官方的 /_AMapService）。
+       * - 留空 → 使用相对路径 /api/amap（与页面同域）
+       * - https://api.xxx.com → 自动使用 https://api.xxx.com/api/amap
+       * - 已是完整路径（含 /api/amap 或其它 path）→ 原样使用
+       * 详见首页「网关与 AMAP_API_URL 配置说明」。
+       */
       globalThis.__APP_CONFIG__ = {
-        VISION_API_URL: "https://1303863544-1t1wintitt.ap-guangzhou.tencentscf.com"
+        VISION_API_URL: "https://1303863544-1t1wintitt.ap-guangzhou.tencentscf.com",
+        AMAP_API_URL: ""
       };
 
       function loadScript(src) {

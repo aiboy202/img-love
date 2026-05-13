@@ -125,8 +125,81 @@ label{display:block; font-size:13px; color:var(--muted); margin-bottom:8px}
 .integration-item{border:1px solid var(--border); border-radius:16px; padding:12px; background:rgba(255,255,255,.03)}
 .integration-title{font-weight:800}
 .integration-desc{color:var(--muted); margin-top:6px; font-size:12px; line-height:1.4}
+.integration-desc a{color:var(--primary);text-decoration:underline;text-underline-offset:2px}
+.gateway-details{margin-top:14px;border:1px solid var(--border);border-radius:16px;padding:12px 14px;background:rgba(0,0,0,.12)}
+.gateway-details summary{cursor:pointer;font-weight:800;color:var(--text);list-style-position:outside}
+.gateway-body{margin-top:10px;font-size:12px;line-height:1.55}
+.gateway-body p{margin:0.5em 0}
+.gateway-body ul{margin:6px 0;padding-left:1.2rem}
+.gateway-body code{font-size:11px}
+.gateway-pre{
+  font-size:11px;line-height:1.45;
+  background:rgba(0,0,0,.3);padding:12px;border-radius:12px;overflow:auto;
+  border:1px solid var(--border);color:var(--text);margin:8px 0
+}
+.gateway-warn{
+  padding:10px 12px;border-radius:12px;border:1px solid rgba(79,140,255,.35);
+  background:rgba(79,140,255,.1);color:var(--text);margin-bottom:12px
+}
+.gateway-warn a{color:var(--primary)}
 @media (max-width:720px){
   .integration{grid-template-columns:1fr}
   .item-top{flex-direction:column}
   .topbar{position:sticky}
+}
+
+/* 子地点 */
+.places-wrap{display:flex;flex-direction:column;gap:10px;margin:10px 0 4px}
+.place-row{
+  border:1px solid var(--border);
+  border-radius:14px;
+  padding:10px 12px;
+  background:rgba(0,0,0,.18);
+}
+.place-row-top{display:flex;justify-content:space-between;gap:10px;align-items:flex-start;flex-wrap:wrap}
+.place-name{font-weight:800;font-size:14px;line-height:1.3;max-width:100%}
+.place-status{font-size:11px;padding:3px 8px;border-radius:999px;border:1px solid var(--border);color:var(--muted);white-space:nowrap}
+.place-status[data-st="ok"]{border-color:rgba(0,208,130,.35);color:#7dffc8}
+.place-status[data-st="fail"],.place-status[data-st="empty"]{border-color:rgba(255,77,79,.25);color:#ffb4b4}
+.place-meta{font-size:12px;color:var(--muted);margin-top:4px;line-height:1.35}
+.place-tags{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.place-tag{font-size:11px;padding:3px 7px;border-radius:999px;border:1px solid var(--border);background:rgba(255,255,255,.04)}
+.place-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+
+/* 地图全屏 */
+.map-dialog{padding:0;width:100vw;max-width:100vw;height:100vh;max-height:100vh;border:none;background:rgba(11,18,32,.98)}
+.map-dialog::backdrop{background:rgba(0,0,0,.65)}
+.map-shell{display:flex;flex-direction:column;height:100%;min-height:0}
+.map-toolbar{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border-bottom:1px solid var(--border);gap:12px}
+.map-toolbar-title{font-weight:900;font-size:16px}
+.map-toolbar2{padding:10px 14px;border-bottom:1px solid var(--border);align-items:flex-end}
+.map-split{display:flex;flex:1;min-height:0;flex-direction:row}
+.map-canvas{flex:1;min-width:0;min-height:280px}
+.map-side{
+  width:min(380px, 100vw);
+  border-left:1px solid var(--border);
+  display:flex;
+  flex-direction:column;
+  min-height:0;
+  background:rgba(15,26,46,.5);
+}
+.map-side-head{padding:10px 12px;font-size:12px;border-bottom:1px solid var(--border)}
+.map-point-list{flex:1;overflow:auto;padding:8px;display:flex;flex-direction:column;gap:8px}
+.map-point-row{
+  display:flex;gap:8px;align-items:flex-start;
+  border:1px solid var(--border);border-radius:12px;padding:8px 10px;
+  background:rgba(0,0,0,.12);
+  cursor:default;
+}
+.map-point-row input[type="checkbox"]{margin-top:4px}
+.map-point-main{flex:1;min-width:0}
+.map-point-title{font-weight:700;font-size:13px;line-height:1.25}
+.map-point-sub{font-size:11px;color:var(--muted);margin-top:3px;line-height:1.35}
+.map-point-dist{font-size:11px;color:var(--muted);margin-top:4px}
+.map-route-actions{padding:10px 12px;border-top:1px solid var(--border)}
+.map-route-meta{padding:0 12px 12px;font-size:12px;line-height:1.4}
+@media (max-width:900px){
+  .map-split{flex-direction:column}
+  .map-side{width:100%;border-left:none;border-top:1px solid var(--border);max-height:42vh}
+  .map-canvas{min-height:45vh}
 }
