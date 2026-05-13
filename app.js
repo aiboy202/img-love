@@ -502,6 +502,8 @@ async function resolvePlacesAmap(item) {
         if (!chunkIds.has(pl.id)) continue;
         const r = byId.get(pl.id);
         if (r && r.ok && r.pick && r.pick.location) {
+          // keep top candidates for UI confirmation
+          pl.candidates = Array.isArray(r.pois) ? r.pois : [];
           pl.amap = {
             id: r.pick.id,
             name: r.pick.name,
@@ -509,7 +511,8 @@ async function resolvePlacesAmap(item) {
             location: r.pick.location,
             typecode: r.pick.typecode
           };
-          pl.resolveStatus = "ok";
+          // mark as suggested until user confirms in map sidebar
+          pl.resolveStatus = "suggested";
         } else {
           pl.amap = null;
           pl.resolveStatus = "fail";
@@ -641,7 +644,8 @@ function collectFlatPoints(items, { city } = {}) {
         lng: loc.lng,
         lat: loc.lat,
         tags: pl.categoryTags || [],
-        loc
+        loc,
+        confirmed: pl.resolveStatus === "ok"
       });
     }
   }
@@ -1445,18 +1449,29 @@ function renderMapSidebarList() {
   els.mapPointList.innerHTML = "";
   const user = mapRuntime.userLngLat;
   for (const r of rows) {
-    const row = document.createElement("label");
+    const row = document.createElement("div");
     row.className = "map-point-row";
     row.dataset.itemId = r.itemId;
     row.dataset.placeId = r.placeId;
     const cb = document.createElement("input");
     cb.type = "checkbox";
-    cb.disabled = !r.loc;
+    // route planning only for confirmed points
+    cb.disabled = !r.loc || r.resolveStatus !== "ok";
     const main = document.createElement("div");
     main.className = "map-point-main";
     const t = document.createElement("div");
     t.className = "map-point-title";
-    t.textContent = r.label;
+    const st =
+      r.resolveStatus === "ok"
+        ? "已确认"
+        : r.resolveStatus === "suggested"
+          ? "待确认"
+          : r.resolveStatus === "fail"
+            ? "未匹配"
+            : r.resolveStatus === "empty"
+              ? "信息不足"
+              : "待解析";
+    t.textContent = `${r.label} · ${st}`;
     const s = document.createElement("div");
     s.className = "map-point-sub";
     s.textContent = [r.city, r.sub].filter(Boolean).join(" · ");
@@ -1471,6 +1486,104 @@ function renderMapSidebarList() {
     }
     row.appendChild(cb);
     row.appendChild(main);
+
+    const actions = document.createElement("div");
+    actions.style.display = "flex";
+    actions.style.flexWrap = "wrap";
+    actions.style.gap = "8px";
+    actions.style.alignItems = "center";
+
+    if (r.resolveStatus === "suggested" || r.resolveStatus === "fail") {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "btn btn-ghost";
+      btn.textContent = r.resolveStatus === "suggested" ? "确认/改选" : "重新匹配";
+      btn.addEventListener("click", async () => {
+        const it = state.items.find((x) => x.id === r.itemId);
+        if (!it) return;
+        ensureItemPlacesShape(it);
+        const pl = (it.places || []).find((p) => p.id === r.placeId);
+        if (!pl) return;
+
+        // if no candidates yet, retry resolve
+        if (!Array.isArray(pl.candidates) || pl.candidates.length === 0 || r.resolveStatus === "fail") {
+          pl.resolveStatus = "pending";
+          pl.amap = null;
+          await resolvePlacesAmap(it);
+          await putItem(it);
+          await refresh();
+        }
+
+        const candidates = Array.isArray(pl.candidates) ? pl.candidates : [];
+        if (!candidates.length) {
+          alert("没有候选结果。你可以编辑 OCR 文本/地点关键词后再试，或减少无关文字。");
+          return;
+        }
+
+        const lines = candidates
+          .slice(0, 3)
+          .map((p, idx) => `${idx + 1}. ${p.name}${p.address ? "｜" + p.address : ""}`)
+          .join("\n");
+        const ans = prompt(`请选择候选 POI（输入 1-3），取消则不变：\n\n${lines}`, "1");
+        if (!ans) return;
+        const n = Number(String(ans).trim());
+        if (!Number.isFinite(n) || n < 1 || n > Math.min(3, candidates.length)) return;
+        const pick = candidates[n - 1];
+        pl.amap = {
+          id: pick.id,
+          name: pick.name,
+          address: pick.address,
+          location: pick.location,
+          typecode: pick.typecode,
+          cityname: pick.cityname,
+          adname: pick.adname
+        };
+        pl.resolveStatus = "ok";
+
+        // city override: prefer POI city if available
+        const poiCity = String(pick.cityname || "").replace(/市$/u, "").trim();
+        if (poiCity) it.city = poiCity;
+        await putItem(it);
+        await refresh();
+        try {
+          rebuildMapMarkers();
+          renderMapSidebarList();
+        } catch {
+          // ignore
+        }
+      });
+      actions.appendChild(btn);
+    }
+
+    if (r.loc) {
+      const nav = document.createElement("button");
+      nav.type = "button";
+      nav.className = "btn btn-ghost";
+      nav.textContent = "导航";
+      nav.addEventListener("click", () => {
+        const it = state.items.find((x) => x.id === r.itemId);
+        if (!it) return;
+        ensureItemPlacesShape(it);
+        const pl = (it.places || []).find((p) => p.id === r.placeId);
+        const loc = parseLngLatStr(pl?.amap?.location);
+        const name = pl?.amap?.name || pl?.name || it.title || "目的地";
+        if (loc) {
+          // Prefer AMap app URI, fallback to web
+          const uri = `amapuri://route/plan/?dlat=${encodeURIComponent(String(loc.lat))}&dlon=${encodeURIComponent(
+            String(loc.lng)
+          )}&dname=${encodeURIComponent(name)}&dev=0&t=0`;
+          const web = buildAmapDirToLngLat(loc.lng, loc.lat, name);
+          // Try open app; if blocked or not installed, user can use web button from browser UI/back
+          window.location.href = uri;
+          setTimeout(() => window.open(web, "_blank", "noopener,noreferrer"), 600);
+        } else {
+          window.open(buildAmapRouteUrl(buildPlaceSearchKeyword(it.city, pl)), "_blank", "noopener,noreferrer");
+        }
+      });
+      actions.appendChild(nav);
+    }
+
+    row.appendChild(actions);
     els.mapPointList.appendChild(row);
   }
 }
@@ -1508,7 +1621,7 @@ function rebuildMapMarkers() {
     (p) =>
       new AMap.Marker({
         position: [p.lng, p.lat],
-        title: p.label,
+        title: p.confirmed ? p.label : `（待确认）${p.label}`,
         extData: { ...p }
       })
   );

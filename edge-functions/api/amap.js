@@ -185,6 +185,8 @@ export default async function onRequest(context) {
             id: String(p?.id || ""),
             name: String(p?.name || "").trim(),
             address: String(p?.address || "").trim(),
+            cityname: String(p?.cityname || "").trim(),
+            adname: String(p?.adname || "").trim(),
             typecode: String(p?.typecode || "").trim(),
             location: String(p?.location || "").trim()
           }))
@@ -224,11 +226,21 @@ export default async function onRequest(context) {
           results.push({ refId, ok: false, reason: "amap", info: data?.info, infocode: data?.infocode });
           continue;
         }
-        const first = Array.isArray(data?.pois) && data.pois.length ? data.pois[0] : null;
-        if (!first) {
+        const top = Array.isArray(data?.pois) ? data.pois.slice(0, 3) : [];
+        if (!top.length) {
           results.push({ refId, ok: false, reason: "no_results" });
           continue;
         }
+        const pois = top.map((p) => ({
+          id: String(p?.id || "").trim(),
+          name: String(p?.name || "").trim(),
+          address: String(p?.address || "").trim(),
+          cityname: String(p?.cityname || "").trim(),
+          adname: String(p?.adname || "").trim(),
+          typecode: String(p?.typecode || "").trim(),
+          location: String(p?.location || "").trim()
+        }));
+        const first = pois[0];
         results.push({
           refId,
           ok: true,
@@ -236,9 +248,12 @@ export default async function onRequest(context) {
             id: String(first?.id || "").trim(),
             name: String(first?.name || "").trim(),
             address: String(first?.address || "").trim(),
+            cityname: String(first?.cityname || "").trim(),
+            adname: String(first?.adname || "").trim(),
             typecode: String(first?.typecode || "").trim(),
             location: String(first?.location || "").trim()
-          }
+          },
+          pois
         });
       }
       return json({ ok: true, results });
