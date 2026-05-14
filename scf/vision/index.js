@@ -12,6 +12,65 @@
 const BIGMODEL_BASE_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions";
 const DEFAULT_VISION_MODEL = "glm-4.6v";
 
+const PLACE_NAME_ENUM_SPLIT = /[、，,;；\/|｜\r\n]+/;
+const PLACE_SECTION_HEADERS = new Set(
+  [
+    "土菜馆",
+    "川菜",
+    "川菜和鱼",
+    "简餐",
+    "火锅",
+    "烧烤",
+    "日料",
+    "日料店",
+    "西餐",
+    "咖啡",
+    "咖啡店",
+    "甜品",
+    "甜品店",
+    "小吃",
+    "快餐",
+    "面食",
+    "海鲜",
+    "汤锅",
+    "自助",
+    "早茶",
+    "茶饮",
+    "轻食",
+    "茶餐厅",
+    "韩料",
+    "泰餐",
+    "酒吧",
+    "本地菜",
+    "家常菜"
+  ].map((s) => s.trim())
+);
+
+function expandPlacesByNameEnumeration(places) {
+  const out = [];
+  for (const pl of places) {
+    const name = typeof pl.name === "string" ? pl.name.trim() : "";
+    if (!name) continue;
+    if (!PLACE_NAME_ENUM_SPLIT.test(name)) {
+      if (!PLACE_SECTION_HEADERS.has(name)) out.push({ ...pl, name: name.slice(0, 80) });
+      continue;
+    }
+    const parts = name
+      .split(PLACE_NAME_ENUM_SPLIT)
+      .map((s) => s.trim())
+      .filter((s) => s.length >= 2 && !PLACE_SECTION_HEADERS.has(s));
+    if (parts.length <= 1) {
+      const single = parts[0] || name;
+      if (!PLACE_SECTION_HEADERS.has(single)) out.push({ ...pl, name: single.slice(0, 80) });
+      continue;
+    }
+    for (const seg of parts) {
+      out.push({ ...pl, name: seg.slice(0, 80) });
+    }
+  }
+  return out;
+}
+
 /** 部分触发器把整段 event 序列化成字符串传入 */
 function normalizeEvent(raw) {
   if (raw == null) return {};
@@ -178,7 +237,8 @@ async function handleVision(event) {
     "- interests：1~4 个；无把握 [\"未分类\"]。",
     "【places】",
     "- 每条对应可地图检索的命名实体；路名写入 road/addressHint，不要单独当一条路一个 place。",
-    "- 同一 POI 合并一条；rawQuote 仅一句<=80字。",
+    "- **便利贴/清单「分类 + 多店」**：分类词只进 categoryTags；**每个店名单独一条**；顿号/逗号并列多名必须拆成多条，勿只保留第一个。",
+    "- 同一店合并一条；rawQuote 仅一句<=80字。",
     "- confidence：0~1。",
     "你可能会得到这些提示：",
     `- cityHint: ${cityHint || "(none)"}`,
@@ -186,7 +246,8 @@ async function handleVision(event) {
   ].join("\n");
 
   const userText = [
-    "请阅读整张截图：判断类型→去噪提炼→输出 JSON。",
+    "请阅读整张截图：判断类型（含分类便签清单）→去噪提炼→输出 JSON。",
+    "若为「分类 + 多店名」：每个店名各一条 places；分类进 categoryTags。",
     "注意：只输出 JSON；text 为提炼正文，非全文 OCR。"
   ].join("\n");
 
@@ -274,8 +335,7 @@ async function handleVision(event) {
         note: typeof p.note === "string" ? p.note.trim().slice(0, 120) : "",
         rawQuote: typeof p.rawQuote === "string" ? p.rawQuote.trim().slice(0, 120) : ""
       };
-    })
-    .slice(0, 24);
+    });
 
   const legacyPoi = typeof parsed.poi === "string" ? parsed.poi.trim().slice(0, 80) : "";
   const legacyAddress = typeof parsed.address === "string" ? parsed.address.trim().slice(0, 120) : "";
@@ -291,6 +351,8 @@ async function handleVision(event) {
       rawQuote: ""
     });
   }
+
+  places = expandPlacesByNameEnumeration(places).slice(0, 24);
 
   const tagSet = new Set(interests);
   for (const pl of places) for (const t of pl.categoryTags) if (t) tagSet.add(t);

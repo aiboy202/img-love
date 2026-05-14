@@ -405,6 +405,71 @@ function formatDistanceM(m) {
   return `${(m / 1000).toFixed(1)} km`;
 }
 
+const PLACE_NAME_ENUM_SPLIT = /[、，,;；\/|｜\r\n]+/;
+const PLACE_SECTION_HEADERS = new Set(
+  [
+    "土菜馆",
+    "川菜",
+    "川菜和鱼",
+    "简餐",
+    "火锅",
+    "烧烤",
+    "日料",
+    "日料店",
+    "西餐",
+    "咖啡",
+    "咖啡店",
+    "甜品",
+    "甜品店",
+    "小吃",
+    "快餐",
+    "面食",
+    "海鲜",
+    "汤锅",
+    "自助",
+    "早茶",
+    "茶饮",
+    "轻食",
+    "茶餐厅",
+    "韩料",
+    "泰餐",
+    "酒吧",
+    "本地菜",
+    "家常菜"
+  ].map((s) => s.trim())
+);
+
+/** 与 vision/semantic 接口一致：顿号并列店名拆条；分类词单行不入列 */
+function expandPlacesByNameEnumerationForItem(places) {
+  const flat = [];
+  for (const pl of places) {
+    const name = typeof pl.name === "string" ? pl.name.trim() : "";
+    if (!name) {
+      flat.push(pl);
+      continue;
+    }
+    if (!PLACE_NAME_ENUM_SPLIT.test(name)) {
+      if (!PLACE_SECTION_HEADERS.has(name)) flat.push(pl);
+      continue;
+    }
+    const parts = name
+      .split(PLACE_NAME_ENUM_SPLIT)
+      .map((s) => s.trim())
+      .filter((s) => s.length >= 2 && !PLACE_SECTION_HEADERS.has(s));
+    if (parts.length <= 1) {
+      const single = parts[0] || name;
+      if (PLACE_SECTION_HEADERS.has(single)) continue;
+      if (parts.length === 1 && single !== name) flat.push({ ...pl, id: uid(), name: single.slice(0, 80) });
+      else flat.push(pl);
+      continue;
+    }
+    for (const seg of parts) {
+      flat.push({ ...pl, id: uid(), name: seg.slice(0, 80) });
+    }
+  }
+  return flat.slice(0, 24);
+}
+
 function placesFromVisionPayload(ai, fallbackCity) {
   const city = typeof ai?.city === "string" && ai.city.trim() ? ai.city.trim() : fallbackCity || "未知";
   const raw = Array.isArray(ai?.places) ? ai.places : [];
@@ -443,11 +508,12 @@ function placesFromVisionPayload(ai, fallbackCity) {
       resolveStatus: poi || addr ? "pending" : "empty"
     });
   }
-  for (const pl of out) {
+  const places = expandPlacesByNameEnumerationForItem(out);
+  for (const pl of places) {
     const kw = buildPlaceSearchKeyword(city, pl);
     if (!kw) pl.resolveStatus = "empty";
   }
-  return { city, places: out };
+  return { city, places };
 }
 
 function ensureItemPlacesShape(it) {

@@ -27,6 +27,65 @@ function safeJsonParse(s) {
   }
 }
 
+const PLACE_NAME_ENUM_SPLIT = /[、，,;；\/|｜\r\n]+/;
+const PLACE_SECTION_HEADERS = new Set(
+  [
+    "土菜馆",
+    "川菜",
+    "川菜和鱼",
+    "简餐",
+    "火锅",
+    "烧烤",
+    "日料",
+    "日料店",
+    "西餐",
+    "咖啡",
+    "咖啡店",
+    "甜品",
+    "甜品店",
+    "小吃",
+    "快餐",
+    "面食",
+    "海鲜",
+    "汤锅",
+    "自助",
+    "早茶",
+    "茶饮",
+    "轻食",
+    "茶餐厅",
+    "韩料",
+    "泰餐",
+    "酒吧",
+    "本地菜",
+    "家常菜"
+  ].map((s) => s.trim())
+);
+
+function expandPlacesByNameEnumeration(places) {
+  const out = [];
+  for (const pl of places) {
+    const name = typeof pl.name === "string" ? pl.name.trim() : "";
+    if (!name) continue;
+    if (!PLACE_NAME_ENUM_SPLIT.test(name)) {
+      if (!PLACE_SECTION_HEADERS.has(name)) out.push({ ...pl, name: name.slice(0, 80) });
+      continue;
+    }
+    const parts = name
+      .split(PLACE_NAME_ENUM_SPLIT)
+      .map((s) => s.trim())
+      .filter((s) => s.length >= 2 && !PLACE_SECTION_HEADERS.has(s));
+    if (parts.length <= 1) {
+      const single = parts[0] || name;
+      if (!PLACE_SECTION_HEADERS.has(single)) out.push({ ...pl, name: single.slice(0, 80) });
+      continue;
+    }
+    for (const seg of parts) {
+      out.push({ ...pl, name: seg.slice(0, 80) });
+    }
+  }
+  return out;
+}
+
 async function fetchWithTimeout(url, init, timeoutMs) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(new Error(`timeout ${timeoutMs}ms`)), timeoutMs);
@@ -150,6 +209,7 @@ export default async function onRequest(context) {
     "Place = { categoryTags[], name, road, district, addressHint, note, rawQuote }。",
     "- text 字段不要出现在 JSON 中（本接口输入已是 text）；若模型误输出 text 字段将被忽略。",
     "places：只输出**可地图检索的 POI**；路名进 road/addressHint；同一店合并；rawQuote 仅一句<=80字。",
+    "若 OCR 为「分类标题 + 多店名」清单：分类只进 categoryTags；**每个店名单独一条 places**；同一行顿号/逗号并列多名必须拆成多条。",
     "interests：全文 1~4 个标签；categoryTags：单点类型。"
   ].join("\n");
 
@@ -241,8 +301,7 @@ export default async function onRequest(context) {
         note: typeof p.note === "string" ? p.note.trim().slice(0, 120) : "",
         rawQuote: typeof p.rawQuote === "string" ? p.rawQuote.trim().slice(0, 120) : ""
       };
-    })
-    .slice(0, 24);
+    });
 
   const legacyPoi = typeof parsed.poi === "string" ? parsed.poi.trim().slice(0, 80) : "";
   const legacyAddress = typeof parsed.address === "string" ? parsed.address.trim().slice(0, 120) : "";
@@ -259,6 +318,8 @@ export default async function onRequest(context) {
       rawQuote: ""
     });
   }
+
+  places = expandPlacesByNameEnumeration(places).slice(0, 24);
 
   const tagSet = new Set(interests);
   for (const pl of places) for (const t of pl.categoryTags) if (t) tagSet.add(t);

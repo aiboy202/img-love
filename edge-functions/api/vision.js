@@ -27,6 +27,66 @@ function safeJsonParse(s) {
   }
 }
 
+/** 便签/清单里「土菜馆」等分类词，不作为独立 POI；顿号并列的店名则拆成多条 */
+const PLACE_NAME_ENUM_SPLIT = /[、，,;；\/|｜\r\n]+/;
+const PLACE_SECTION_HEADERS = new Set(
+  [
+    "土菜馆",
+    "川菜",
+    "川菜和鱼",
+    "简餐",
+    "火锅",
+    "烧烤",
+    "日料",
+    "日料店",
+    "西餐",
+    "咖啡",
+    "咖啡店",
+    "甜品",
+    "甜品店",
+    "小吃",
+    "快餐",
+    "面食",
+    "海鲜",
+    "汤锅",
+    "自助",
+    "早茶",
+    "茶饮",
+    "轻食",
+    "茶餐厅",
+    "韩料",
+    "泰餐",
+    "酒吧",
+    "本地菜",
+    "家常菜"
+  ].map((s) => s.trim())
+);
+
+function expandPlacesByNameEnumeration(places) {
+  const out = [];
+  for (const pl of places) {
+    const name = typeof pl.name === "string" ? pl.name.trim() : "";
+    if (!name) continue;
+    if (!PLACE_NAME_ENUM_SPLIT.test(name)) {
+      if (!PLACE_SECTION_HEADERS.has(name)) out.push({ ...pl, name: name.slice(0, 80) });
+      continue;
+    }
+    const parts = name
+      .split(PLACE_NAME_ENUM_SPLIT)
+      .map((s) => s.trim())
+      .filter((s) => s.length >= 2 && !PLACE_SECTION_HEADERS.has(s));
+    if (parts.length <= 1) {
+      const single = parts[0] || name;
+      if (!PLACE_SECTION_HEADERS.has(single)) out.push({ ...pl, name: single.slice(0, 80) });
+      continue;
+    }
+    for (const seg of parts) {
+      out.push({ ...pl, name: seg.slice(0, 80) });
+    }
+  }
+  return out;
+}
+
 async function fetchWithTimeout(url, init, timeoutMs) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(new Error(`timeout ${timeoutMs}ms`)), timeoutMs);
@@ -176,8 +236,11 @@ export default async function onRequest(context) {
     "- title：<=26 字，用**具体主题**概括（例如“杭州某店｜排队与必点”），不要用“截图”“抖音”等空泛词。",
     "- city：从正文/定位条/话题/地图信息综合判断；无把握填“未知”。若与 cityHint 冲突，以截图证据为准。",
     "- interests：全文层面 1~4 个兴趣标签；与 categoryTags 可重叠；无把握用 [\"未分类\"]。",
-    "【places：可检索 POI，宁精勿滥】",
-    "- 每个元素应对应**可在地图/点评里检索的命名实体**：餐厅/咖啡馆/景点/乐园/酒店/商场内具体店铺名等。",
+    "【places：可检索 POI；便签清单要「拆店」】",
+    "- 每个元素对应**可在地图/点评里检索的命名实体**：餐厅/咖啡馆/景点/乐园/酒店/商场内具体店铺名等。",
+    "- **抖音/小红书常见「便利贴 + 分类 + 多家店」**：如「土菜馆」下列「老盐渎、华燕土菜」，**分类词只写入 categoryTags（或 interests），不要作为 name**；**每个店名必须单独一条 places**，不得只输出第一个店名。",
+    "- 同一行用 **顿号、逗号、分号、换行** 并列多个店名时，必须输出**多条** places（例：「香辣川味王、谢师傅、川江鱼、本素」→ 4 条）。",
+    "- 「宁精勿滥」指过滤**界面噪声/UI 套话**，不是省略便签里**已写明的真实店名**；此类截图应在 24 条上限内**尽量列全**可见店名。",
     "- 不要把**单独一条路名**当成一个 place（除非截图主旨就是该路段导航且无法落到具体 POI）。路名应写入对应 POI 的 road 或 addressHint。",
     "- 同一店/景点在正文里多次出现：合并为**一条** place，把补充信息写入 note/addressHint。",
     "- categoryTags：该地点类型 1~4 个（美食餐厅、咖啡甜品、旅游景点、酒店民宿、购物、拍照机位、交通攻略等）。",
@@ -192,7 +255,8 @@ export default async function onRequest(context) {
   ].join("\n");
 
   const userText = [
-    "请阅读整张截图：先判断内容类型（探店/攻略/地图/纯文字），再做去噪与信息提炼，最后按 JSON 结构输出。",
+    "请阅读整张截图：先判断内容类型（探店/攻略/地图/纯文字/分类便签清单），再做去噪与信息提炼，最后按 JSON 结构输出。",
+    "若为「分类标题 + 多店名」清单：每个店名各一条 places；分类进 categoryTags；并列店名勿合并成一条。",
     "注意：只输出 JSON；text 必须是提炼后的正文，不是原始 OCR 全文。"
   ].join("\n");
 
@@ -286,8 +350,7 @@ export default async function onRequest(context) {
         note: typeof p.note === "string" ? p.note.trim().slice(0, 120) : "",
         rawQuote: typeof p.rawQuote === "string" ? p.rawQuote.trim().slice(0, 120) : ""
       };
-    })
-    .slice(0, 24);
+    });
 
   const legacyPoi = typeof parsed.poi === "string" ? parsed.poi.trim().slice(0, 80) : "";
   const legacyAddress = typeof parsed.address === "string" ? parsed.address.trim().slice(0, 120) : "";
@@ -303,6 +366,8 @@ export default async function onRequest(context) {
       rawQuote: ""
     });
   }
+
+  places = expandPlacesByNameEnumeration(places).slice(0, 24);
 
   const tagSet = new Set(interests);
   for (const pl of places) for (const t of pl.categoryTags) if (t) tagSet.add(t);
