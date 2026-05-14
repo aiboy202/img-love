@@ -366,8 +366,14 @@ async function amapRest(payload) {
 }
 
 function buildPlaceSearchKeyword(city, place) {
+  let c = String(city || "").trim();
+  if (!c || c === "未知" || c === "全部") c = "";
+  else if (/市$/u.test(c)) {
+    const w = c.replace(/市$/u, "").trim();
+    if (w.length >= 2) c = w;
+  }
   const parts = [
-    city && city !== "未知" && city !== "全部" ? city : "",
+    c,
     place?.district || "",
     place?.road || "",
     place?.name || "",

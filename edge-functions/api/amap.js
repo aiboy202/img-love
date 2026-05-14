@@ -101,6 +101,69 @@ function mergePolylines(steps) {
   return out;
 }
 
+/** 关键字检索的 city：高德对「盐城」常比「盐城市」更稳 */
+function normalizeAmapTextCity(city) {
+  let c = String(city || "")
+    .trim()
+    .replace(/^(全部|未知)$/u, "");
+  if (!c) return "";
+  if (/市$/u.test(c)) {
+    const s = c.replace(/市$/u, "").trim();
+    if (s.length >= 2) return s.slice(0, 24);
+  }
+  return c.slice(0, 24);
+}
+
+function parseBizExtObject(p) {
+  const raw = p?.biz_ext;
+  if (raw == null) return null;
+  if (typeof raw === "object") return raw;
+  if (typeof raw === "string") {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/** 同名多结果时：评分优先，其次有电话、人均略高（作弱代理「人气」；高德未提供开业年限） */
+function rankPoisForDefaultPick(pois) {
+  const scored = (pois || []).map((p, idx) => {
+    const biz = parseBizExtObject(p) || {};
+    const r = Number(String(biz.rating ?? biz.star ?? "").trim());
+    const rating = Number.isFinite(r) ? r : -1;
+    const cost = Number(String(biz.cost ?? "").trim());
+    const costN = Number.isFinite(cost) ? cost : 0;
+    const hasTel = String(p?.tel || "").trim().length > 5 ? 1 : 0;
+    return { p, rating, hasTel, costN, idx };
+  });
+  scored.sort((a, b) => {
+    if (b.rating !== a.rating) return b.rating - a.rating;
+    if (b.hasTel !== a.hasTel) return b.hasTel - a.hasTel;
+    if (b.costN !== a.costN) return b.costN - a.costN;
+    return a.idx - b.idx;
+  });
+  return scored.map((x) => x.p);
+}
+
+function mapPoiForClient(p) {
+  const biz = parseBizExtObject(p) || {};
+  const r = Number(String(biz.rating ?? "").trim());
+  const out = {
+    id: String(p?.id || "").trim(),
+    name: String(p?.name || "").trim(),
+    address: String(p?.address || "").trim(),
+    cityname: String(p?.cityname || "").trim(),
+    adname: String(p?.adname || "").trim(),
+    typecode: String(p?.typecode || "").trim(),
+    location: String(p?.location || "").trim()
+  };
+  if (Number.isFinite(r)) out.rating = r;
+  return out;
+}
+
 export default async function onRequest(context) {
   const { request } = context;
   const env = context?.env || {};
@@ -121,7 +184,7 @@ export default async function onRequest(context) {
     return json({
       ok: true,
       service: "img_love/amap",
-      hint: "浏览器 POST JSON 到此路径；服务端需配置 AMAP_REST_KEY（高德「Web 服务」Key）。",
+      hint: "浏览器 POST JSON 到此路径；服务端需配置 AMAP_REST_KEY（高德「Web 服务」Key）。resolvePlaces 会去掉城市名末尾「市」再检索，并在无结果时放宽 citylimit。",
       cors: "本接口 GET/POST/OPTIONS 均返回 Access-Control-Allow-Origin: *，便于静态页跨域调用。",
       gateway: [
         "若经 API 网关转发：须对 OPTIONS 与错误响应（4xx/5xx）同样返回 CORS 头，否则浏览器会报 Failed to fetch。",
@@ -195,10 +258,13 @@ export default async function onRequest(context) {
     }
 
     if (action === "resolvePlaces") {
-      const city = String(body?.city || "").trim().slice(0, 24);
+      const rawCtxCity = String(body?.city || "").trim().slice(0, 24);
       const queries = Array.isArray(body?.queries) ? body.queries : [];
       if (!queries.length) return badRequest("Missing field: queries");
       if (queries.length > 20) return badRequest("Too many queries (max 20)");
+
+      const normCtx = normalizeAmapTextCity(rawCtxCity);
+      const rawOk = rawCtxCity && rawCtxCity !== "未知" && rawCtxCity !== "全部";
 
       const results = [];
       for (const q of queries) {
@@ -208,38 +274,50 @@ export default async function onRequest(context) {
           results.push({ refId, ok: false, reason: "empty_keywords" });
           continue;
         }
-        const url = buildUrl("/v3/place/text", {
-          key,
-          keywords,
-          city: city && city !== "未知" && city !== "全部" ? city : "",
-          citylimit: city && city !== "未知" && city !== "全部" ? "true" : "false",
-          offset: 3,
-          page: 1,
-          extensions: "base"
-        });
-        const { ok, data } = await fetchJson(url);
-        if (!ok) {
-          results.push({ refId, ok: false, reason: "http", details: data });
+
+        const attempts = [];
+        if (normCtx) attempts.push({ city: normCtx, citylimit: true, tag: "city_norm" });
+        if (rawOk && rawCtxCity !== normCtx) attempts.push({ city: rawCtxCity, citylimit: true, tag: "city_raw" });
+        if (normCtx || rawOk) attempts.push({ city: normCtx || rawCtxCity, citylimit: false, tag: "citylimit_off" });
+        attempts.push({ city: "", citylimit: false, tag: "no_city" });
+
+        let best = null;
+        let lastFail = null;
+        for (const att of attempts) {
+          const url = buildUrl("/v3/place/text", {
+            key,
+            keywords,
+            city: att.city || "",
+            citylimit: att.citylimit ? "true" : "false",
+            offset: 10,
+            page: 1,
+            extensions: "all"
+          });
+          const { ok, data } = await fetchJson(url);
+          if (!ok) {
+            lastFail = { reason: "http", details: data };
+            continue;
+          }
+          if (String(data?.status) !== "1") {
+            lastFail = { reason: "amap", info: data?.info, infocode: data?.infocode };
+            continue;
+          }
+          const list = Array.isArray(data?.pois) ? data.pois : [];
+          if (!list.length) {
+            lastFail = { reason: "no_results", tryTag: att.tag };
+            continue;
+          }
+          best = list;
+          break;
+        }
+
+        if (!best || !best.length) {
+          results.push({ refId, ok: false, ...(lastFail || { reason: "no_results" }) });
           continue;
         }
-        if (String(data?.status) !== "1") {
-          results.push({ refId, ok: false, reason: "amap", info: data?.info, infocode: data?.infocode });
-          continue;
-        }
-        const top = Array.isArray(data?.pois) ? data.pois.slice(0, 3) : [];
-        if (!top.length) {
-          results.push({ refId, ok: false, reason: "no_results" });
-          continue;
-        }
-        const pois = top.map((p) => ({
-          id: String(p?.id || "").trim(),
-          name: String(p?.name || "").trim(),
-          address: String(p?.address || "").trim(),
-          cityname: String(p?.cityname || "").trim(),
-          adname: String(p?.adname || "").trim(),
-          typecode: String(p?.typecode || "").trim(),
-          location: String(p?.location || "").trim()
-        }));
+
+        const ranked = rankPoisForDefaultPick(best);
+        const pois = ranked.slice(0, 3).map(mapPoiForClient);
         const first = pois[0];
         results.push({
           refId,
@@ -251,7 +329,8 @@ export default async function onRequest(context) {
             cityname: String(first?.cityname || "").trim(),
             adname: String(first?.adname || "").trim(),
             typecode: String(first?.typecode || "").trim(),
-            location: String(first?.location || "").trim()
+            location: String(first?.location || "").trim(),
+            ...(typeof first?.rating === "number" ? { rating: first.rating } : {})
           },
           pois
         });
