@@ -439,6 +439,101 @@ const PLACE_SECTION_HEADERS = new Set(
   ].map((s) => s.trim())
 );
 
+function reEscapeForRegex(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+const GENERIC_NON_POI_NAMES = new Set(
+  ["美食推荐", "餐厅推荐", "本地美食", "美食", "餐厅", "推荐", "攻略", "指南", "探店", "打卡", "必吃", "网红店"].map((s) => s.trim())
+);
+
+function isUsablePoiName(n) {
+  const t = typeof n === "string" ? n.trim() : "";
+  if (t.length < 2 || t.length > 28) return false;
+  if (PLACE_SECTION_HEADERS.has(t)) return false;
+  if (GENERIC_NON_POI_NAMES.has(t)) return false;
+  if (/^\d+$/.test(t)) return false;
+  if (/(美食|吃货)(推荐|攻略)$/.test(t)) return false;
+  if (/^.+市(美食|吃货)?(推荐|攻略)?$/.test(t) && t.length <= 12) return false;
+  return true;
+}
+
+function inferVenueNamesFromGuideBlob(text) {
+  if (!text || typeof text !== "string") return [];
+  let s = text.slice(0, 6000);
+  s = s.replace(/感兴趣的可以截图|展开+|共\d+人推荐\S*|美食指南|本地人去的馆子/gi, " ");
+  s = s.replace(/>\s*\d+/g, " ");
+  s = s.replace(/[@#＠]\w*/g, " ");
+  const headersSorted = Array.from(PLACE_SECTION_HEADERS).sort((a, b) => b.length - a.length);
+  for (const h of headersSorted) {
+    if (h.length < 2) continue;
+    const re = new RegExp(`(?:^|[\\s\u3000])${reEscapeForRegex(h)}(?=[\\s\u3000]|$)`, "g");
+    s = s.replace(re, " ");
+  }
+  s = s.replace(/[|｜>《》【】···.]+/g, " ");
+  s = s.replace(/[、，,;；\s\u3000]+/g, " ").trim();
+  const rawParts = s.split(/\s+/).map((x) => x.trim()).filter(Boolean);
+  const seen = new Set();
+  const out = [];
+  for (let t of rawParts) {
+    t = t.replace(/^@\S+/, "").trim();
+    if (!isUsablePoiName(t)) continue;
+    if (/^(盐城市|盐城|北京市|上海市|天津市|重庆市|广州市|深圳市|杭州市|苏州市|南京市|成都市|武汉市|西安市)$/.test(t)) continue;
+    if (/推荐|指南|截图|关注|粉丝|点赞|主页|直播/.test(t) && t.length < 12) continue;
+    if (seen.has(t)) continue;
+    seen.add(t);
+    out.push(t);
+  }
+  return out;
+}
+
+function recoverPlacesFromVisionTextForClient(places, text, interests) {
+  const inferred = inferVenueNamesFromGuideBlob(text);
+  if (inferred.length < 2) return places;
+
+  const goodRows = places.filter((p) => isUsablePoiName(p?.name));
+  if (goodRows.length >= 3) return places;
+
+  const tagsBase = interests.filter((x) => x && x !== "未分类").slice(0, 4);
+  const ct = tagsBase.length ? tagsBase : ["美食"];
+
+  if (goodRows.length === 0) {
+    return inferred.slice(0, 24).map((name) => ({
+      id: uid(),
+      categoryTags: [...ct].slice(0, 8),
+      name: name.slice(0, 80),
+      road: "",
+      district: "",
+      addressHint: "",
+      note: "",
+      rawQuote: "",
+      amap: null,
+      resolveStatus: "pending"
+    }));
+  }
+
+  const have = new Set(goodRows.map((p) => String(p.name || "").trim()));
+  const merged = goodRows.map((p) => ({ ...p }));
+  for (const nm of inferred) {
+    if (merged.length >= 24) break;
+    if (have.has(nm)) continue;
+    merged.push({
+      id: uid(),
+      categoryTags: [...ct].slice(0, 8),
+      name: nm.slice(0, 80),
+      road: "",
+      district: "",
+      addressHint: "",
+      note: "",
+      rawQuote: "",
+      amap: null,
+      resolveStatus: "pending"
+    });
+    have.add(nm);
+  }
+  return merged.length > goodRows.length ? merged : places;
+}
+
 /** 与 vision/semantic 接口一致：顿号并列店名拆条；分类词单行不入列 */
 function expandPlacesByNameEnumerationForItem(places) {
   const flat = [];
@@ -508,7 +603,9 @@ function placesFromVisionPayload(ai, fallbackCity) {
       resolveStatus: poi || addr ? "pending" : "empty"
     });
   }
-  const places = expandPlacesByNameEnumerationForItem(out);
+  const interests = Array.isArray(ai?.interests) ? ai.interests.map((x) => String(x).trim()).filter(Boolean) : [];
+  let places = expandPlacesByNameEnumerationForItem(out);
+  places = recoverPlacesFromVisionTextForClient(places, typeof ai?.text === "string" ? ai.text : "", interests);
   for (const pl of places) {
     const kw = buildPlaceSearchKeyword(city, pl);
     if (!kw) pl.resolveStatus = "empty";
