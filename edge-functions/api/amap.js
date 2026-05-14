@@ -50,16 +50,70 @@ function findKvAny(context) {
   return null;
 }
 
-async function readAmapKey(env) {
-  if (typeof env?.AMAP_REST_KEY === "string" && env.AMAP_REST_KEY.trim()) return env.AMAP_REST_KEY.trim();
-  if (typeof env?.AMAP_KEY === "string" && env.AMAP_KEY.trim()) return env.AMAP_KEY.trim();
-  const kv = findKvAny({ env })?.kv;
+function normalizeSecretString(s) {
+  if (typeof s !== "string") return "";
+  return s.replace(/^\uFEFF/, "").replace(/[\r\n]/g, "").trim();
+}
+
+/** 同一项目可能绑定多个 KV；需在每一个里尝试读取高德 Key */
+function collectKvNamespaces(env) {
+  const out = [];
+  const seen = new Set();
+  if (env && typeof env === "object") {
+    for (const v of Object.values(env)) {
+      if (isKvNamespace(v) && !seen.has(v)) {
+        seen.add(v);
+        out.push(v);
+      }
+    }
+  }
+  try {
+    for (const k of Object.getOwnPropertyNames(globalThis)) {
+      if (k.length > 64) continue;
+      const v = globalThis[k];
+      if (isKvNamespace(v) && !seen.has(v)) {
+        seen.add(v);
+        out.push(v);
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return out;
+}
+
+async function readAmapKeyFromOneKv(kv) {
   if (!kv) return "";
-  const v =
-    (await kv.get("AMAP_REST_KEY")) ||
-    (await kv.get("AMAP_KEY")) ||
-    (await kv.get("amap_rest_key"));
-  return typeof v === "string" ? v.trim() : "";
+  const tryKeys = [
+    "AMAP_REST_KEY",
+    "AMAP_KEY",
+    "amap_rest_key",
+    "amap-rest-key",
+    "AMAP_WEB_KEY",
+    "GAODE_REST_KEY",
+    "GD_REST_KEY"
+  ];
+  for (const kn of tryKeys) {
+    const variants = [kn, kn.toLowerCase(), kn.replace(/_/g, "-").toLowerCase()];
+    for (const k of variants) {
+      const raw = await kv.get(k);
+      const v = normalizeSecretString(typeof raw === "string" ? raw : "");
+      if (v) return v;
+    }
+  }
+  return "";
+}
+
+async function readAmapKey(env) {
+  const fromEnv =
+    normalizeSecretString(typeof env?.AMAP_REST_KEY === "string" ? env.AMAP_REST_KEY : "") ||
+    normalizeSecretString(typeof env?.AMAP_KEY === "string" ? env.AMAP_KEY : "");
+  if (fromEnv) return fromEnv;
+  for (const kv of collectKvNamespaces(env)) {
+    const v = await readAmapKeyFromOneKv(kv);
+    if (v) return v;
+  }
+  return "";
 }
 
 async function fetchJson(url) {
@@ -85,6 +139,10 @@ function parseLngLat(s) {
   const parts = s.split(",").map((x) => Number(String(x).trim()));
   if (parts.length !== 2 || !Number.isFinite(parts[0]) || !Number.isFinite(parts[1])) return null;
   return { lng: parts[0], lat: parts[1] };
+}
+
+function hasValidAmapLocation(loc) {
+  return parseLngLat(String(loc || "").trim()) != null;
 }
 
 function mergePolylines(steps) {
@@ -181,10 +239,22 @@ export default async function onRequest(context) {
   }
 
   if (request.method === "GET") {
+    const urlObj = new URL(request.url);
+    let probe = null;
+    if (urlObj.searchParams.get("probe") === "1") {
+      const k = await readAmapKey(env);
+      probe = {
+        amapKeyLoaded: Boolean(k),
+        amapKeyCharLength: k ? k.length : 0,
+        kvBindingCount: collectKvNamespaces(env).length,
+        envHasAMAP_REST_KEY: Boolean(normalizeSecretString(typeof env?.AMAP_REST_KEY === "string" ? env.AMAP_REST_KEY : ""))
+      };
+    }
     return json({
       ok: true,
       service: "img_love/amap",
       hint: "浏览器 POST JSON 到此路径；服务端需配置 AMAP_REST_KEY（高德「Web 服务」Key）。resolvePlaces 会去掉城市名末尾「市」再检索，并在无结果时放宽 citylimit。",
+      selftest: "GET 加 ?probe=1 可检查 Worker 是否读到 Key（不返回 Key 内容）。KV 中键名建议 AMAP_REST_KEY；勿混入换行。",
       cors: "本接口 GET/POST/OPTIONS 均返回 Access-Control-Allow-Origin: *，便于静态页跨域调用。",
       gateway: [
         "若经 API 网关转发：须对 OPTIONS 与错误响应（4xx/5xx）同样返回 CORS 头，否则浏览器会报 Failed to fetch。",
@@ -195,7 +265,8 @@ export default async function onRequest(context) {
         "routeDriving — body: { action, origin, destination, waypoints? }",
         "placeText — body: { action, keywords, city?, offset? }",
         "regeo — body: { action, location }"
-      ]
+      ],
+      ...(probe ? { probe } : {})
     });
   }
 
@@ -307,7 +378,13 @@ export default async function onRequest(context) {
             lastFail = { reason: "no_results", tryTag: att.tag };
             continue;
           }
-          best = list;
+          const withLoc = list.filter((p) => hasValidAmapLocation(p?.location));
+          const usable = withLoc.length ? withLoc : list;
+          if (!usable.some((p) => hasValidAmapLocation(p?.location))) {
+            lastFail = { reason: "no_valid_location", tryTag: att.tag, poiCount: list.length };
+            continue;
+          }
+          best = usable;
           break;
         }
 
@@ -317,7 +394,11 @@ export default async function onRequest(context) {
         }
 
         const ranked = rankPoisForDefaultPick(best);
-        const pois = ranked.slice(0, 3).map(mapPoiForClient);
+        const pois = ranked.slice(0, 3).map(mapPoiForClient).filter((p) => hasValidAmapLocation(p.location));
+        if (!pois.length) {
+          results.push({ refId, ok: false, reason: "no_valid_location_after_map" });
+          continue;
+        }
         const first = pois[0];
         results.push({
           refId,

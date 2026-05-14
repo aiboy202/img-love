@@ -386,6 +386,16 @@ function buildPlaceSearchKeyword(city, place) {
   return q.slice(0, 96);
 }
 
+function formatAmapResolveFailure(r) {
+  if (!r) return "无匹配条目（请检查 /api/amap 是否部署、Network 是否 200）";
+  if (r.ok === false) {
+    const bits = [r.reason, r.info, r.infocode, r.tryTag, r.status].filter((x) => x != null && String(x).trim() !== "");
+    return bits.length ? bits.map(String).join(" · ").slice(0, 320) : "高德返回失败";
+  }
+  if (!r.pick?.location) return "高德有结果但缺少坐标（location）";
+  return "未知原因";
+}
+
 function parseLngLatStr(s) {
   if (!s || typeof s !== "string") return null;
   const [a, b] = s.split(",").map((x) => Number(String(x).trim()));
@@ -680,11 +690,13 @@ async function resolvePlacesAmap(item) {
             location: r.pick.location,
             typecode: r.pick.typecode
           };
+          pl.amapRestError = "";
           // mark as suggested until user confirms in map sidebar
           pl.resolveStatus = "suggested";
         } else {
           pl.amap = null;
           pl.resolveStatus = "fail";
+          pl.amapRestError = formatAmapResolveFailure(r);
         }
       }
     }
@@ -692,13 +704,16 @@ async function resolvePlacesAmap(item) {
       if (pl.resolveStatus === "pending") {
         pl.resolveStatus = "fail";
         pl.amap = null;
+        pl.amapRestError = pl.amapRestError || "未返回结果（可能未进本轮 batch）";
       }
     }
-  } catch {
+  } catch (e) {
+    const msg = String(e?.message || e).slice(0, 320);
     for (const pl of pending) {
       if (pl.resolveStatus === "pending") {
         pl.resolveStatus = "fail";
         pl.amap = null;
+        pl.amapRestError = msg;
       }
     }
   }
@@ -1340,6 +1355,7 @@ function renderItems() {
         st.dataset.st = stKey;
         st.textContent =
           pl.resolveStatus === "ok" ? "已定位" : pl.resolveStatus === "fail" ? "未匹配到POI" : pl.resolveStatus === "empty" ? "检索词不足" : "待解析";
+        if (pl.resolveStatus === "fail" && pl.amapRestError) st.title = pl.amapRestError;
         prowTop.appendChild(nameEl);
         prowTop.appendChild(st);
         row.appendChild(prowTop);
@@ -1708,6 +1724,7 @@ function renderMapSidebarList() {
           adname: pick.adname
         };
         pl.resolveStatus = "ok";
+        pl.amapRestError = "";
 
         // city override: prefer POI city if available
         const poiCity = String(pick.cityname || "").replace(/市$/u, "").trim();
@@ -1971,7 +1988,8 @@ function openEditDialog(item) {
             note: typeof p?.note === "string" ? p.note : "",
             rawQuote: typeof p?.rawQuote === "string" ? p.rawQuote : "",
             amap: p?.amap && typeof p.amap === "object" ? p.amap : null,
-            resolveStatus: typeof p?.resolveStatus === "string" ? p.resolveStatus : "pending"
+            resolveStatus: typeof p?.resolveStatus === "string" ? p.resolveStatus : "pending",
+            amapRestError: typeof p?.amapRestError === "string" ? p.amapRestError : ""
           }));
         } catch (err) {
           alert(`地点 JSON 无效：${String(err?.message || err)}`);
