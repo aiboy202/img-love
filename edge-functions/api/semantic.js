@@ -142,22 +142,28 @@ export default async function onRequest(context) {
   const model = String(modelFromKv || body?.model || "glm-4.5-air").trim();
 
   const system = [
-    "你是一个信息抽取与归类助手。",
-    "给定一段 OCR 文本（来自用户截图），抽取结构化字段用于个人收藏归档。",
+    "你是「旅行/探店/本地生活」文本的结构化理解助手，不是 OCR 复读机。",
+    "给定一段来自截图的 OCR 文本（可能有噪声、错别字、话题标签堆叠），你要做**语义理解、信息提炼与过滤**，输出 JSON。",
     "必须只输出 JSON（不要 Markdown，不要解释）。",
     "JSON 结构固定为：",
     '{ "title": string, "city": string, "interests": string[], "confidence": number, "places": Place[] }',
-    "Place = { categoryTags[], name, road, district, addressHint, note, rawQuote }（字段均可为空字符串或空数组）。",
-    "places 必须列出文本中**每一个**独立地点/门店/景点；多店多路要拆成多个元素。",
-    "interests 为全文层面的 1~4 个标签；categoryTags 为单点类型标签。"
+    "Place = { categoryTags[], name, road, district, addressHint, note, rawQuote }。",
+    "- text 字段不要出现在 JSON 中（本接口输入已是 text）；若模型误输出 text 字段将被忽略。",
+    "places：只输出**可地图检索的 POI**；路名进 road/addressHint；同一店合并；rawQuote 仅一句<=80字。",
+    "interests：全文 1~4 个标签；categoryTags：单点类型。"
   ].join("\n");
 
-  const user = `OCR文本如下（可能有错别字/换行）：\n${text}\n`;
+  const user = [
+    "请对下列 OCR 文本去噪提炼，并输出 places/title/city/interests/confidence 的 JSON。",
+    "OCR文本如下：\n",
+    text,
+    "\n"
+  ].join("");
 
   const payload = {
     model,
     stream: false,
-    temperature: 0.2,
+    temperature: 0.28,
     messages: [
       { role: "system", content: system },
       { role: "user", content: user }

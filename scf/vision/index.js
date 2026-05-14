@@ -157,8 +157,8 @@ async function handleVision(event) {
   const model = String(process.env.BIGMODEL_VISION_MODEL || body?.model || DEFAULT_VISION_MODEL).trim();
 
   const system = [
-    "你是一个截图信息抽取与归类助手。",
-    "输入是一张截图图片。你需要先识别图片中的文字（OCR），再理解文字意思，并输出结构化 JSON。",
+    "你是「旅行/探店/本地生活」截图的结构化理解助手，不是简单 OCR 抄写员。",
+    "输入是一张截图（常见：抖音/小红书/大众点评/地图/备忘录）。你要结合**版面、字号、位置条、地图钉、话题标签**与正文，做**语义理解、信息提炼与噪声过滤**，再输出 JSON。",
     "必须只输出 JSON（不要 Markdown，不要解释）。",
     "JSON 结构固定为：",
     '{ "title": string, "city": string, "interests": string[], "text": string, "confidence": number, "places": Place[] }',
@@ -171,26 +171,29 @@ async function handleVision(event) {
     '  "note": string,',
     '  "rawQuote": string',
     "}",
-    "规则：",
-    "- text：尽量完整的 OCR 文本（可包含换行）。",
-    "- title：<=26字，概括整张截图主题。",
-    "- city：从内容判断城市；没有把握填“未知”。",
-    "- interests：整张截图层面的 1~4 个兴趣标签；无把握用 [\"未分类\"]。",
-    "- places：每一个独立地点/门店/景点；多店多路必须拆成多个元素。",
-    "- categoryTags：该地点类型标签（美食餐厅/咖啡甜品/旅游景点/酒店民宿/购物/拍照机位/交通攻略等），1~4 个。",
-    "- name/road/district/addressHint/note/rawQuote：无则空字符串。",
+    "【提炼与过滤】",
+    "- text：经提炼的正文（去 UI 套话、重复 hashtag、无信息口播），保留对收藏有用的关键句，约 1200 字内。",
+    "- title：<=26 字，具体主题，避免“截图/抖音”等空泛词。",
+    "- city：综合判断；无把握填“未知”。",
+    "- interests：1~4 个；无把握 [\"未分类\"]。",
+    "【places】",
+    "- 每条对应可地图检索的命名实体；路名写入 road/addressHint，不要单独当一条路一个 place。",
+    "- 同一 POI 合并一条；rawQuote 仅一句<=80字。",
     "- confidence：0~1。",
     "你可能会得到这些提示：",
     `- cityHint: ${cityHint || "(none)"}`,
     `- interestHint: ${interestHint || "(none)"}`
   ].join("\n");
 
-  const userText = ["请对这张截图做 OCR，并按规则输出 JSON。", "注意：只输出 JSON。"].join("\n");
+  const userText = [
+    "请阅读整张截图：判断类型→去噪提炼→输出 JSON。",
+    "注意：只输出 JSON；text 为提炼正文，非全文 OCR。"
+  ].join("\n");
 
   const payload = {
     model,
     stream: false,
-    temperature: 0.2,
+    temperature: 0.28,
     messages: [
       { role: "system", content: system },
       {
@@ -242,7 +245,8 @@ async function handleVision(event) {
     return json(502, { error: "Model output is not valid JSON", content }, event);
   }
 
-  const text = typeof parsed.text === "string" ? parsed.text : "";
+  const textRaw = typeof parsed.text === "string" ? parsed.text : "";
+  const text = textRaw.length > 12000 ? textRaw.slice(0, 12000) : textRaw;
   const title = typeof parsed.title === "string" ? parsed.title.trim().slice(0, 40) : "";
   let city = typeof parsed.city === "string" ? parsed.city.trim().slice(0, 12) : "未知";
   if (!city) city = "未知";

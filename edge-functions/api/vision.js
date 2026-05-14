@@ -157,8 +157,8 @@ export default async function onRequest(context) {
     const model = String(modelFromKv || body?.model || "glm-4.6v").trim();
 
   const system = [
-    "你是一个截图信息抽取与归类助手。",
-    "输入是一张截图图片。你需要先识别图片中的文字（OCR），再理解文字意思，并输出结构化 JSON。",
+    "你是「旅行/探店/本地生活」截图的结构化理解助手，不是简单 OCR 抄写员。",
+    "输入是一张截图（常见：抖音/小红书/大众点评/地图/备忘录）。你要结合**版面、字号、位置条、地图钉、话题标签**与正文，做**语义理解、信息提炼与噪声过滤**，再输出 JSON。",
     "必须只输出 JSON（不要 Markdown，不要解释）。",
     "JSON 结构固定为：",
     '{ "title": string, "city": string, "interests": string[], "text": string, "confidence": number, "places": Place[] }',
@@ -171,34 +171,35 @@ export default async function onRequest(context) {
     '  "note": string,',
     '  "rawQuote": string',
     "}",
-    "规则：",
-    "- text：尽量完整的 OCR 文本（可包含换行）。",
-    "- title：<=26字，概括整张截图主题（可为并列主题合并）。",
-    "- city：从内容判断城市；没有把握填“未知”。",
-    "- interests：整张截图层面的 1~4 个兴趣标签（与 categoryTags 可重叠）；无把握用 [\"未分类\"]。",
-    "- places：从截图中抽取的**每一个**独立地点/门店/景点/路口兴趣点；一张图里提到几条路、几家店就要输出多少个元素。",
-    "- categoryTags：该地点的类型标签（如：美食餐厅、咖啡甜品、旅游景点、酒店民宿、购物、拍照机位、交通攻略等），1~4 个。",
-    "- name：店名/景点名/地标名；不确定可空字符串。",
-    "- road：路名/街巷名；无则空字符串。",
-    "- district：区/县；无则空字符串。",
-    "- addressHint：便于地图检索的地址片段（门牌/商场楼层/附近地标）；无则空字符串。",
-    "- note：短备注（人均、排队、营业时间摘要等）；无则空字符串。",
-    "- rawQuote：支持该地点的 OCR 原文一句（<=80字）；无则空字符串。",
-    "- confidence：0~1 的整体置信度。",
+    "【提炼与过滤（重要）】",
+    "- text：写**经提炼的正文**，不是把界面上的字逐行照抄。去掉：无意义的 UI 文案（如“点赞收藏”“关注”“展开全文”“点击查看更多”“直播中”等）、重复堆叠的 hashtag、纯表情、与地点/攻略无关的口播套话；保留：店名/景点名、地址片段、价格人均、排队/预约提示、营业时间、推荐理由、路线关键句等**对收藏与检索有用**的信息。可换行，控制在约 1200 字以内（超出可截断）。",
+    "- title：<=26 字，用**具体主题**概括（例如“杭州某店｜排队与必点”），不要用“截图”“抖音”等空泛词。",
+    "- city：从正文/定位条/话题/地图信息综合判断；无把握填“未知”。若与 cityHint 冲突，以截图证据为准。",
+    "- interests：全文层面 1~4 个兴趣标签；与 categoryTags 可重叠；无把握用 [\"未分类\"]。",
+    "【places：可检索 POI，宁精勿滥】",
+    "- 每个元素应对应**可在地图/点评里检索的命名实体**：餐厅/咖啡馆/景点/乐园/酒店/商场内具体店铺名等。",
+    "- 不要把**单独一条路名**当成一个 place（除非截图主旨就是该路段导航且无法落到具体 POI）。路名应写入对应 POI 的 road 或 addressHint。",
+    "- 同一店/景点在正文里多次出现：合并为**一条** place，把补充信息写入 note/addressHint。",
+    "- categoryTags：该地点类型 1~4 个（美食餐厅、咖啡甜品、旅游景点、酒店民宿、购物、拍照机位、交通攻略等）。",
+    "- name：尽量标准店名/景点官方名；只有昵称时写昵称并在 note 说明。",
+    "- road / district / addressHint：能拆则拆，便于后续地图检索。",
+    "- note：人均、排队、预约、营业时间摘要、套餐关键词等短信息。",
+    "- rawQuote：**一句**最能支撑该 place 的原文摘录（<=80 字），不要整段营销长文。",
+    "- confidence：0~1，对「提炼是否正确、地点是否可靠」的综合自信度。",
     "你可能会得到这些提示：",
     `- cityHint: ${cityHint || "(none)"}`,
     `- interestHint: ${interestHint || "(none)"}`
   ].join("\n");
 
   const userText = [
-    "请对这张截图做 OCR，并按规则输出 JSON。",
-    "注意：只输出 JSON。"
+    "请阅读整张截图：先判断内容类型（探店/攻略/地图/纯文字），再做去噪与信息提炼，最后按 JSON 结构输出。",
+    "注意：只输出 JSON；text 必须是提炼后的正文，不是原始 OCR 全文。"
   ].join("\n");
 
   const payload = {
     model,
     stream: false,
-    temperature: 0.2,
+    temperature: 0.28,
     messages: [
       { role: "system", content: system },
       {
@@ -256,7 +257,8 @@ export default async function onRequest(context) {
     return json({ error: "Model output is not valid JSON", model, content }, { status: 502 });
   }
 
-  const text = typeof parsed.text === "string" ? parsed.text : "";
+  const textRaw = typeof parsed.text === "string" ? parsed.text : "";
+  const text = textRaw.length > 12000 ? textRaw.slice(0, 12000) : textRaw;
   const title = typeof parsed.title === "string" ? parsed.title.trim().slice(0, 40) : "";
   let city = typeof parsed.city === "string" ? parsed.city.trim().slice(0, 12) : "未知";
   if (!city) city = "未知";
