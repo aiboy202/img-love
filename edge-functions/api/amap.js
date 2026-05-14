@@ -90,8 +90,13 @@ async function readAmapKeyFromOneKv(kv) {
     "amap_rest_key",
     "amap-rest-key",
     "AMAP_WEB_KEY",
+    "AMAP_WEB_SERVICE_KEY",
     "GAODE_REST_KEY",
-    "GD_REST_KEY"
+    "GAODE_KEY",
+    "GD_REST_KEY",
+    "gd_key",
+    "amap_key",
+    "AMAPKEY"
   ];
   for (const kn of tryKeys) {
     const variants = [kn, kn.toLowerCase(), kn.replace(/_/g, "-").toLowerCase()];
@@ -102,6 +107,29 @@ async function readAmapKeyFromOneKv(kv) {
     }
   }
   return "";
+}
+
+/** probe 用：列出 KV 中已有键名（不含值），便于核对是否写错键名 */
+async function sampleKvKeyNames(kv, maxKeys) {
+  if (!kv || typeof kv.list !== "function") return [];
+  const cap = Math.min(80, Math.max(1, maxKeys || 50));
+  const names = [];
+  try {
+    let cursor;
+    while (names.length < cap) {
+      const page = await kv.list({ limit: Math.min(100, cap - names.length), ...(cursor ? { cursor } : {}) });
+      const keys = Array.isArray(page?.keys) ? page.keys : [];
+      for (const row of keys) {
+        const n = row?.name;
+        if (typeof n === "string" && n.trim()) names.push(n.trim());
+      }
+      if (page?.list_complete || !page?.cursor) break;
+      cursor = page.cursor;
+    }
+  } catch {
+    return names.slice(0, cap);
+  }
+  return names.slice(0, cap);
 }
 
 async function readAmapKey(env) {
@@ -242,12 +270,42 @@ export default async function onRequest(context) {
     const urlObj = new URL(request.url);
     let probe = null;
     if (urlObj.searchParams.get("probe") === "1") {
+      const kvs = collectKvNamespaces(env);
       const k = await readAmapKey(env);
+      let kvKeyNamesSample = [];
+      let kvListError = null;
+      if (!k && kvs.length) {
+        try {
+          const seen = new Set();
+          for (const kv of kvs) {
+            const chunk = await sampleKvKeyNames(kv, 50);
+            for (const n of chunk) {
+              if (seen.has(n)) continue;
+              seen.add(n);
+              kvKeyNamesSample.push(n);
+              if (kvKeyNamesSample.length >= 60) break;
+            }
+            if (kvKeyNamesSample.length >= 60) break;
+          }
+        } catch (e) {
+          kvListError = String(e?.message || e);
+        }
+      }
       probe = {
         amapKeyLoaded: Boolean(k),
         amapKeyCharLength: k ? k.length : 0,
-        kvBindingCount: collectKvNamespaces(env).length,
-        envHasAMAP_REST_KEY: Boolean(normalizeSecretString(typeof env?.AMAP_REST_KEY === "string" ? env.AMAP_REST_KEY : ""))
+        kvBindingCount: kvs.length,
+        envHasAMAP_REST_KEY: Boolean(normalizeSecretString(typeof env?.AMAP_REST_KEY === "string" ? env.AMAP_REST_KEY : "")),
+        ...(!k
+          ? {
+              fixHint:
+                "未在 KV 中读到高德 Key。请在当前 Worker 已绑定的 KV 命名空间里新增键名 **AMAP_REST_KEY**（值=高德开放平台「Web服务」Key，不要引号、不要换行）。若你用了别的键名，可把该键改名为 AMAP_REST_KEY，或把下方列出的键名发给我们扩展读取列表。",
+              triedKeyNames:
+                "AMAP_REST_KEY, AMAP_KEY, AMAP_WEB_SERVICE_KEY, GAODE_KEY, amap_key 等（代码内已做多组变体尝试）"
+            }
+          : {}),
+        ...(!k && kvs.length ? { kvKeyNamesSample } : {}),
+        ...(kvListError ? { kvListError } : {})
       };
     }
     return json({
