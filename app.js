@@ -1,4 +1,4 @@
-const APP_VERSION = "pwa-mvp-0.2-amap-v3";
+const APP_VERSION = "pwa-mvp-0.2-amap-v4-ocrimg";
 
 const DEFAULT_SETTINGS = {
   ocrLang: "chi_sim",
@@ -1115,8 +1115,17 @@ const TESSERACT_CDN = {
   langPath: "https://tessdata.projectnaptha.com/4.0.0"
 };
 
-async function ocrImage(file, { lang, onProgress, startedAt } = {}) {
-  const url = URL.createObjectURL(file);
+async function ocrImage(source, { lang, onProgress, startedAt } = {}) {
+  let url = "";
+  let revoke = false;
+  if (typeof source === "string" && source.startsWith("data:")) {
+    url = source;
+  } else if (source && typeof source === "object" && typeof source.arrayBuffer === "function") {
+    url = URL.createObjectURL(source);
+    revoke = true;
+  } else {
+    throw new Error("ocrImage: 需要 File/Blob 或 data:image/* 字符串");
+  }
   try {
     const opts = TESSERACT_CDN;
     // Use worker mode to control core/lang asset locations.
@@ -1156,7 +1165,7 @@ async function ocrImage(file, { lang, onProgress, startedAt } = {}) {
       }
     }
   } finally {
-    URL.revokeObjectURL(url);
+    if (revoke) URL.revokeObjectURL(url);
   }
 }
 
@@ -1522,12 +1531,13 @@ async function importFiles(files) {
 
     let text = "";
     let ai = null;
+    let visionImage = "";
     try {
       // High-cost / high-quality mode: use BigModel vision to do OCR + semantic in one pass.
       setProgress("AI 识别中", idx + 1, list.length);
       els.progressBar.style.width = "10%";
 
-      const visionImage = await withTimeout(fileToJpegDataUrlUnderLimit(file), 60_000, "压缩图片");
+      visionImage = await withTimeout(fileToJpegDataUrlUnderLimit(file), 60_000, "压缩图片");
       els.progressBar.style.width = "25%";
 
       ai = await withTimeout(
@@ -1576,21 +1586,34 @@ async function importFiles(files) {
     if (!kwCity || kwCity === "未知" || kwCity === "全部") {
       if (hintCity && hintCity !== "未知" && hintCity !== "全部") kwCity = hintCity;
     }
-    const visionUselessForSearch =
+    const noSearchableKeyword =
       !places.length || places.every((pl) => pl && typeof pl === "object" && !buildPlaceSearchKeyword(kwCity, pl));
-    if (visionUselessForSearch) {
+    const visionTextLen = String(workAi.text || "").trim().length;
+    const allPlaceNamesEmpty = places.length && places.every((pl) => !String(pl?.name || "").trim());
+    const shouldLocalOcr = noSearchableKeyword || (visionTextLen < 20 && allPlaceNamesEmpty);
+    if (shouldLocalOcr) {
+      const src = typeof visionImage === "string" && visionImage.startsWith("data:") ? visionImage : file;
       try {
         setProgress("本地 OCR 补全中", idx + 1, list.length);
-        const ocrText = await ocrImage(file, { lang: state.settings.ocrLang || "chi_sim" });
+        const primaryLang = state.settings.ocrLang || "chi_sim";
+        let ocrText = await ocrImage(src, { lang: primaryLang });
+        if (String(ocrText || "").trim().length < 18) {
+          setProgress("本地 OCR（中英混合）", idx + 1, list.length);
+          const t2 = await ocrImage(src, { lang: "chi_sim+eng" });
+          if (String(t2 || "").trim().length > String(ocrText || "").trim().length) ocrText = t2;
+        }
         const ot = String(ocrText || "").trim();
         if (ot) {
           workAi.text = [typeof workAi.text === "string" ? workAi.text : "", ocrText].filter((x) => String(x || "").trim()).join("\n\n");
           const r2 = placesFromVisionPayload(workAi, hintCity);
           places = r2.places;
           if (r2.city && r2.city !== "未知" && r2.city !== "全部") city = r2.city;
+        } else {
+          els.progressText.textContent = `本地 OCR 未识别到文字（${idx + 1}/${list.length}）· 可在设置换语言或换更清晰的截图`;
         }
       } catch (e) {
         console.warn("本地 OCR 补全失败", e);
+        els.progressText.textContent = `本地 OCR 失败：${String(e?.message || e).slice(0, 120)}`;
       }
     }
 
