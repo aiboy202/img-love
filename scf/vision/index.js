@@ -375,7 +375,7 @@ async function handleVision(event) {
       {
         ok: true,
         service: "img_love/vision",
-        revision: "2026-05-15-hybrid-ocr-v7",
+        revision: "2026-05-15-hybrid-ocr-v8",
         hint: "POST JSON：{ imageDataUrl, cityHint?, interestHint?, model? }；需配置 BIGMODEL_API_KEY"
       },
       event

@@ -1,4 +1,4 @@
-const APP_VERSION = "pwa-mvp-0.2-amap-v7-ocr-pipeline";
+const APP_VERSION = "pwa-mvp-0.2-amap-v8-hybrid-ocr";
 
 const DEFAULT_SETTINGS = {
   ocrLang: "chi_sim",
@@ -673,6 +673,91 @@ function inferVenueNamesFromGuideBlob(text) {
   return out;
 }
 
+function chineseTextScore(text) {
+  const t = String(text || "");
+  const cjk = (t.match(/[\u4e00-\u9fff]/g) || []).length;
+  const lines = t.split(/\r?\n/).filter((l) => l.trim().length >= 2).length;
+  return cjk + lines * 2;
+}
+
+/** 把 OCR 单行/无换行正文拆成候选行（手写便签 1.店名 2.菜系） */
+function expandTextToCandidateLines(text) {
+  const raw = normalizeOcrTextForChinese(String(text || ""));
+  const seen = new Set();
+  const out = [];
+  const push = (s) => {
+    let u = String(s || "")
+      .replace(/^\s*\d{1,3}\s*[\.\、．。:：\)）\]]\s*/, "")
+      .replace(/^[\-•●○◦·\s]+/, "")
+      .trim();
+    if (u.length < 2 || u.length > 48) return;
+    if (isPlaceholderPoiName(u)) return;
+    if (seen.has(u)) return;
+    seen.add(u);
+    out.push(u);
+  };
+  for (const line of raw.split(/\r?\n/)) push(line);
+  const numbered = raw.matchAll(/(?:^|[\n\r])\s*\d{1,2}\s*[\.\、．:：]\s*([\u4e00-\u9fffA-Za-z0-9]{2,24})/g);
+  for (const m of numbered) push(m[1]);
+  if (out.length <= 2 && raw.length >= 6) {
+    for (const part of raw.split(/[、，,;；|｜\/\s]+/)) push(part);
+    const blob = raw.replace(/\s+/g, "");
+    if (blob.length >= 6 && blob.length <= 120) {
+      const chunks = blob.match(/[\u4e00-\u9fff]{2,12}/g) || [];
+      for (const c of chunks) push(c);
+    }
+  }
+  return out;
+}
+
+function isAggressiveSearchLine(line) {
+  const t = String(line || "").trim();
+  if (t.length < 2 || t.length > 40) return false;
+  if (isPlaceholderPoiName(t)) return false;
+  if (/^(点赞|收藏|关注|展开|直播中|抖音|小红书|截图收藏|本地 OCR)/.test(t)) return false;
+  const cjk = (t.match(/[\u4e00-\u9fff]/g) || []).length;
+  if (cjk >= 2 && cjk / Math.max(1, t.length) >= 0.45) return true;
+  return isLikelySearchLine(t);
+}
+
+function placesFromAggressiveTextSalvage(text, interests) {
+  const tagsBase = (Array.isArray(interests) ? interests : []).filter((x) => x && x !== "未分类").slice(0, 4);
+  const ct = tagsBase.length ? tagsBase : ["美食"];
+  const seen = new Set();
+  const out = [];
+  for (const u of expandTextToCandidateLines(text)) {
+    if (!isAggressiveSearchLine(u)) continue;
+    if (seen.has(u)) continue;
+    seen.add(u);
+    out.push({
+      id: uid(),
+      categoryTags: [...ct].slice(0, 8),
+      name: u.slice(0, 80),
+      road: "",
+      district: "",
+      addressHint: "",
+      note: "",
+      rawQuote: u.slice(0, 120),
+      amap: null,
+      resolveStatus: "pending"
+    });
+    if (out.length >= 24) break;
+  }
+  return out;
+}
+
+function stripUnsearchablePlaces(places) {
+  if (!Array.isArray(places)) return [];
+  return places.filter((pl) => {
+    if (!pl || typeof pl !== "object") return false;
+    const name = String(pl.name || "").trim();
+    const rq = String(pl.rawQuote || "").trim();
+    if (isUsablePoiName(name)) return true;
+    if (rq.length >= 2 && !isPlaceholderPoiName(rq)) return true;
+    return false;
+  });
+}
+
 /** 从 OCR/vision 正文按行生成地点（手写便签、菜单兜底） */
 function isLikelySearchLine(line) {
   const t = String(line || "").trim();
@@ -719,14 +804,43 @@ function placesFromRawTextLines(text, interests) {
 /** 统一：vision/OCR 文本 → places + city */
 function finalizeImportRecognition(workAi, hintCity, interests) {
   const work = workAi && typeof workAi === "object" ? { ...workAi } : { text: "" };
+  if (typeof work.text === "string") work.text = normalizeOcrTextForChinese(work.text);
+
   let { city, places } = placesFromVisionPayload(work, hintCity);
+  places = stripUnsearchablePlaces(places);
+
   const salvaged = finalSalvagePlacesFromText(work, places, hintCity, interests);
-  places = salvaged.places;
+  places = stripUnsearchablePlaces(salvaged.places);
   if (salvaged.city && salvaged.city !== "未知" && salvaged.city !== "全部") city = salvaged.city;
 
   if (!placesHaveSearchableKeyword(city, places)) {
     const fromLines = placesFromRawTextLines(work.text, interests);
     if (fromLines.length) places = fromLines;
+  }
+  if (!placesHaveSearchableKeyword(city, places)) {
+    const agg = placesFromAggressiveTextSalvage(work.text, interests);
+    if (agg.length) places = agg;
+  }
+  if (!placesHaveSearchableKeyword(city, places) && chineseTextScore(work.text) >= 4) {
+    const lines = expandTextToCandidateLines(work.text);
+    const first = lines.find((l) => isAggressiveSearchLine(l) || isLikelySearchLine(l));
+    if (first) {
+      const ct = (Array.isArray(interests) ? interests : []).filter((x) => x && x !== "未分类");
+      places = [
+        {
+          id: uid(),
+          categoryTags: (ct.length ? ct : ["美食"]).slice(0, 8),
+          name: first.slice(0, 80),
+          road: "",
+          district: "",
+          addressHint: "",
+          note: "",
+          rawQuote: first.slice(0, 120),
+          amap: null,
+          resolveStatus: "pending"
+        }
+      ];
+    }
   }
 
   for (const pl of places) {
@@ -886,7 +1000,9 @@ function placesFromVisionPayload(ai, fallbackCity) {
   }
   const interests = Array.isArray(ai?.interests) ? ai.interests.map((x) => String(x).trim()).filter(Boolean) : [];
   let places = expandPlacesByNameEnumerationForItem(out);
+  places = stripUnsearchablePlaces(places);
   places = recoverPlacesFromVisionTextForClient(places, typeof ai?.text === "string" ? ai.text : "", interests);
+  places = stripUnsearchablePlaces(places);
   for (const pl of places) {
     const kw = buildPlaceSearchKeyword(city, pl);
     if (!kw) pl.resolveStatus = "empty";
@@ -1194,7 +1310,46 @@ async function fileToJpegDataUrlForVision(file) {
 
 /** 本地 OCR 用更高分辨率，避免长截图小字被压糊 */
 async function fileToJpegDataUrlForOcr(file) {
-  return fileToJpegDataUrl(file, { maxDim: 1920, quality: 0.88 });
+  return fileToJpegDataUrl(file, { maxDim: 2048, quality: 0.9 });
+}
+
+function loadImageFromDataUrl(dataUrl) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("加载 OCR 预处理图失败"));
+    img.src = dataUrl;
+  });
+}
+
+/** 黄纸手写/低对比截图：增强后再 OCR */
+async function preprocessDataUrlForOcr(dataUrl, mode = "contrast") {
+  const img = await loadImageFromDataUrl(dataUrl);
+  const w = img.naturalWidth || img.width;
+  const h = img.naturalHeight || img.height;
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d", { alpha: false });
+  if (!ctx) return dataUrl;
+  ctx.drawImage(img, 0, 0, w, h);
+  const id = ctx.getImageData(0, 0, w, h);
+  const d = id.data;
+  for (let i = 0; i < d.length; i += 4) {
+    const r = d[i];
+    const g = d[i + 1];
+    const b = d[i + 2];
+    let lum = 0.299 * r + 0.587 * g + 0.114 * b;
+    if (mode === "invert-note" && r > 165 && g > 145 && b < 175) lum = 255 - lum;
+    let v = lum;
+    if (mode === "contrast" || mode === "invert-note") {
+      v = Math.min(255, Math.max(0, (v - 128) * 1.75 + 128));
+    }
+    if (mode === "threshold") v = v > 158 ? 255 : v < 98 ? 0 : v;
+    d[i] = d[i + 1] = d[i + 2] = v;
+  }
+  ctx.putImageData(id, 0, 0);
+  return canvas.toDataURL("image/jpeg", 0.92);
 }
 
 async function fileToJpegDataUrlUnderLimit(file, { byteLimit = 900_000 } = {}) {
@@ -1361,13 +1516,44 @@ function normalizeTesseractStatus(status) {
   return String(status);
 }
 
-const TESSERACT_CDN = {
-  workerPath: "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/worker.min.js",
-  corePath: "https://cdn.jsdelivr.net/npm/tesseract.js-core@5.1.1",
-  langPath: "https://tessdata.projectnaptha.com/4.0.0"
-};
+const TESSERACT_PROFILES = [
+  {
+    id: "jsdelivr-gh",
+    workerPath: "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/worker.min.js",
+    corePath: "https://cdn.jsdelivr.net/npm/tesseract.js-core@5.1.1",
+    langPath: "https://cdn.jsdelivr.net/gh/naptha/tessdata@gh-pages/4.0.0"
+  },
+  {
+    id: "fastly-naptha",
+    workerPath: "https://fastly.jsdelivr.net/npm/tesseract.js@5.1.1/dist/worker.min.js",
+    corePath: "https://fastly.jsdelivr.net/npm/tesseract.js-core@5.1.1",
+    langPath: "https://tessdata.projectnaptha.com/4.0.0"
+  },
+  {
+    id: "unpkg-naptha",
+    workerPath: "https://unpkg.com/tesseract.js@5.1.1/dist/worker.min.js",
+    corePath: "https://unpkg.com/tesseract.js-core@5.1.1",
+    langPath: "https://tessdata.projectnaptha.com/4.0.0"
+  }
+];
 
-const ocrRuntime = { worker: null, lang: "", initPromise: null };
+const ocrRuntime = { worker: null, lang: "", profileId: "", initPromise: null, profileIndex: 0 };
+
+async function terminateOcrWorkerOnly() {
+  if (ocrRuntime.worker) {
+    try {
+      await ocrRuntime.worker.terminate();
+    } catch {
+      // ignore
+    }
+    ocrRuntime.worker = null;
+  }
+}
+
+async function resetOcrWorker() {
+  ocrRuntime.initPromise = null;
+  await terminateOcrWorkerOnly();
+}
 
 async function ensureOcrWorker(lang, onProgress) {
   const L = lang || "chi_sim";
@@ -1378,33 +1564,43 @@ async function ensureOcrWorker(lang, onProgress) {
   ocrRuntime.initPromise = (async () => {
     const createWorker = globalThis.Tesseract?.createWorker;
     if (typeof createWorker !== "function") {
-      throw new Error("Tesseract.createWorker 不可用");
+      throw new Error("Tesseract.createWorker 不可用（脚本未加载或被拦截）");
     }
-    if (ocrRuntime.worker) {
+    await terminateOcrWorkerOnly();
+
+    const start = ocrRuntime.profileIndex % TESSERACT_PROFILES.length;
+    let lastErr = null;
+    for (let i = 0; i < TESSERACT_PROFILES.length; i++) {
+      const profile = TESSERACT_PROFILES[(start + i) % TESSERACT_PROFILES.length];
       try {
-        await ocrRuntime.worker.terminate();
-      } catch {
-        // ignore
+        const worker = await createWorker({
+          workerPath: profile.workerPath,
+          corePath: profile.corePath,
+          langPath: profile.langPath,
+          logger: (m) => {
+            if (typeof onProgress === "function") {
+              const p = typeof m?.progress === "number" ? m.progress : null;
+              if (p !== null) onProgress(p, m);
+              else if (m?.status) onProgress(null, m);
+            }
+          }
+        });
+        await worker.load();
+        await worker.loadLanguage(L);
+        await worker.initialize(L);
+        ocrRuntime.worker = worker;
+        ocrRuntime.profileId = profile.id;
+        ocrRuntime.profileIndex = (start + i) % TESSERACT_PROFILES.length;
+        console.info("OCR worker 就绪", profile.id);
+        return worker;
+      } catch (e) {
+        lastErr = e;
+        console.warn(`OCR 配置 ${profile.id} 失败，尝试下一镜像…`, e);
+        await terminateOcrWorkerOnly();
       }
-      ocrRuntime.worker = null;
     }
-    const worker = await createWorker({
-      workerPath: TESSERACT_CDN.workerPath,
-      corePath: TESSERACT_CDN.corePath,
-      langPath: TESSERACT_CDN.langPath,
-      logger: (m) => {
-        if (typeof onProgress === "function") {
-          const p = typeof m?.progress === "number" ? m.progress : null;
-          if (p !== null) onProgress(p, m);
-          else if (m?.status) onProgress(null, m);
-        }
-      }
-    });
-    await worker.load();
-    await worker.loadLanguage(L);
-    await worker.initialize(L);
-    ocrRuntime.worker = worker;
-    return worker;
+    ocrRuntime.initPromise = null;
+    throw lastErr || new Error("OCR 引擎初始化失败（请检查网络或 CDN 是否被拦截）");
   })();
 
   return ocrRuntime.initPromise;
@@ -1707,13 +1903,36 @@ function renderItems() {
       node.querySelector(".action-map-item").addEventListener("click", () => openMapExplorer({ focusItemId: it.id }));
       node.querySelector(".action-reresolve").addEventListener("click", async () => {
         ensureItemPlacesShape(it);
-        for (const p of it.places) {
-          const kw = buildPlaceSearchKeyword(it.city, p);
-          p.resolveStatus = kw ? "pending" : "empty";
-          p.amap = null;
+        const needReExtract =
+          it.imageDataUrl &&
+          (!placesHaveSearchableKeyword(it.city, it.places) || chineseTextScore(it.text) < 6);
+        if (needReExtract) {
+          showProgress(true);
+          setProgress("重新识别", 1, 1);
+          try {
+            await reRecognizeStoredItem(it, (phase) => setProgress(phase, 1, 1));
+          } catch (e) {
+            alert(`重新识别失败：${String(e?.message || e)}`);
+            showProgress(false);
+            return;
+          }
+          showProgress(false);
+        } else {
+          for (const p of it.places) {
+            const kw = buildPlaceSearchKeyword(it.city, p);
+            p.resolveStatus = kw ? "pending" : "empty";
+            p.amap = null;
+          }
         }
-        await resolvePlacesAmap(it);
+        setProgress("高德对齐坐标", 1, 1);
+        showProgress(true);
+        try {
+          await resolvePlacesAmap(it);
+        } catch {
+          // keep item
+        }
         await putItem(it);
+        showProgress(false);
         await refresh();
       });
       node.querySelector(".action-delete").addEventListener("click", async () => {
@@ -1771,30 +1990,64 @@ function showProgress(show) {
   }
 }
 
-/** 本地 OCR（复用 worker）；识别阶段单独限时 */
+/** 本地 OCR（复用 worker + 多图预处理）；取中文得分最高结果 */
 async function runLocalOcrForImport(src, lang, onPhase) {
-  const capMs = ocrRuntime.worker ? 120_000 : 300_000;
-  try {
-    let t = await withTimeout(
-      ocrImage(src, {
-        lang,
+  const capMs = ocrRuntime.worker ? 90_000 : 240_000;
+  const passes = [
+    { label: "原图", src, lang },
+    { label: "增强对比", src: null, mode: "contrast", lang },
+    { label: "便签反色", src: null, mode: "invert-note", lang },
+    { label: "二值化", src: null, mode: "threshold", lang }
+  ];
+  let best = "";
+  let bestScore = 0;
+
+  const runOne = async (imageSrc, L, tag) => {
+    const t = await withTimeout(
+      ocrImage(imageSrc, {
+        lang: L,
         onProgress: (_p, m) => {
           const label = normalizeTesseractStatus(m?.status);
-          if (label && typeof onPhase === "function") onPhase(`本地 OCR：${label}`);
+          if (label && typeof onPhase === "function") onPhase(`本地 OCR（${tag}）：${label}`);
         }
       }),
       capMs,
-      "本地 OCR"
-    );
-    t = String(t || "").trim();
-    if (t.length < 8) {
-      const t2 = await withTimeout(ocrImage(src, { lang: "chi_sim+eng" }), 90_000, "本地 OCR 中英").catch(() => "");
-      if (String(t2 || "").trim().length > t.length) t = String(t2).trim();
+      `本地 OCR（${tag}）`
+    ).catch(() => "");
+    return String(t || "").trim();
+  };
+
+  try {
+    for (const p of passes) {
+      let imageSrc = p.src || src;
+      if (p.mode) {
+        try {
+          imageSrc = await preprocessDataUrlForOcr(src, p.mode);
+        } catch {
+          continue;
+        }
+      }
+      if (typeof onPhase === "function") onPhase(`本地 OCR：${p.label}`);
+      let t = await runOne(imageSrc, p.lang || lang, p.label);
+      let score = chineseTextScore(t);
+      if (score > bestScore) {
+        best = t;
+        bestScore = score;
+      }
+      if (bestScore >= 24) break;
     }
-    return t;
+    if (bestScore < 12) {
+      const t2 = await runOne(src, "chi_sim+eng", "中英").catch(() => "");
+      const s2 = chineseTextScore(t2);
+      if (s2 > bestScore) {
+        best = t2;
+        bestScore = s2;
+      }
+    }
+    return best;
   } catch (e) {
     console.warn("本地 OCR 未完成", e);
-    return "";
+    return best;
   }
 }
 
@@ -1802,8 +2055,23 @@ async function runLocalOcrForImport(src, lang, onPhase) {
  * 导入识别：Vision（智谱）+ 本地 OCR 串行，二者正文合并后再抽地点。
  * 手写便签/菜单类截图依赖 OCR；仅信 Vision 常会整段为空。
  */
+async function dataUrlToFile(dataUrl, name = "screenshot.jpg") {
+  const res = await fetch(dataUrl);
+  const blob = await res.blob();
+  return new File([blob], name, { type: blob.type || "image/jpeg" });
+}
+
 async function recognizeScreenshotFile(file, { cityHint, interestHint, interests } = {}, onPhase) {
   const visionImage = await withTimeout(fileToJpegDataUrlForVision(file), 60_000, "压缩图片");
+
+  if (typeof onPhase === "function") onPhase("本地 OCR 识别");
+  let ocrSrc = visionImage;
+  try {
+    ocrSrc = await withTimeout(fileToJpegDataUrlForOcr(file), 45_000, "OCR 用图");
+  } catch {
+    // 使用 vision 图
+  }
+  const ocrText = await runLocalOcrForImport(ocrSrc, state.settings?.ocrLang || "chi_sim", onPhase);
 
   if (typeof onPhase === "function") onPhase("AI 识别中");
   let ai = {};
@@ -1815,16 +2083,11 @@ async function recognizeScreenshotFile(file, { cityHint, interestHint, interests
     ai = { text: "", places: [], city: cityHint || "未知", interests: interests || ["未分类"] };
   }
 
-  if (typeof onPhase === "function") onPhase("本地 OCR 识别");
-  let ocrSrc = visionImage;
-  try {
-    ocrSrc = await withTimeout(fileToJpegDataUrlForOcr(file), 45_000, "OCR 用图");
-  } catch {
-    // 使用 vision 图
-  }
-  const ocrText = await runLocalOcrForImport(ocrSrc, state.settings.ocrLang || "chi_sim", onPhase);
   if (ocrText) {
     ai.text = mergeRecognitionText(typeof ai.text === "string" ? ai.text : "", ocrText);
+  }
+  if (chineseTextScore(ai.text) < 8 && ocrText) {
+    ai.text = ocrText;
   }
 
   const hint = cityHint && cityHint !== "全部" ? cityHint : typeof ai.city === "string" ? ai.city : "未知";
@@ -1836,8 +2099,42 @@ async function recognizeScreenshotFile(file, { cityHint, interestHint, interests
     city: fin.city,
     places: fin.places,
     visionImage,
-    ocrText
+    ocrText,
+    recognitionMeta: {
+      ocrScore: chineseTextScore(ocrText),
+      textScore: chineseTextScore(fin.workAi?.text),
+      ocrProfile: ocrRuntime.profileId || "",
+      at: Date.now()
+    }
   };
+}
+
+/** 对已有收藏（检索词不足）用原图重新跑 OCR+Vision */
+async function reRecognizeStoredItem(item, onPhase) {
+  if (!item?.imageDataUrl) throw new Error("缺少原图，无法重新识别");
+  const file = await dataUrlToFile(item.imageDataUrl, "reimport.jpg");
+  const hintCity = state.settings.currentCity && state.settings.currentCity !== "全部" ? state.settings.currentCity : item.city;
+  const interests = Array.isArray(item.interests) && item.interests.length ? item.interests : ["未分类"];
+  const rec = await recognizeScreenshotFile(
+    file,
+    {
+      cityHint: hintCity,
+      interestHint: interests[0] !== "未分类" ? interests[0] : "",
+      interests
+    },
+    onPhase
+  );
+  const fin = finalizeImportRecognition(rec.ai, hintCity, interests);
+  item.text = fin.workAi.text || item.text;
+  item.city = fin.city || item.city;
+  item.places = fin.places;
+  item.title =
+    typeof rec.ai?.title === "string" && rec.ai.title.trim() && !isPlaceholderPoiName(rec.ai.title)
+      ? rec.ai.title.trim()
+      : guessTitleFromText(item.text) || item.title;
+  if (Array.isArray(rec.ai?.interests) && rec.ai.interests.length) item.interests = rec.ai.interests;
+  item.recognitionMeta = rec.recognitionMeta;
+  return item;
 }
 
 async function importFiles(files) {
@@ -1949,7 +2246,8 @@ async function importFiles(files) {
       aiConfidence: typeof ai?.confidence === "number" ? ai.confidence : 0,
       source: "截图",
       imageDataUrl,
-      imageHash
+      imageHash,
+      recognitionMeta: rec?.recognitionMeta || null
     };
 
     setProgress("高德对齐坐标", idx + 1, list.length);

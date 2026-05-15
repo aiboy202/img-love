@@ -326,16 +326,29 @@
       }
 
       (async () => {
-        // Load tesseract from CDN (EdgeOne build artifacts may omit /vendor).
-        await loadScript("https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js");
-
-        // 2) Only start app after Tesseract is available.
-        if (!globalThis.Tesseract) {
+        const tessUrls = [
+          "https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js",
+          "https://fastly.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js",
+          "https://unpkg.com/tesseract.js@5.1.1/dist/tesseract.min.js"
+        ];
+        let loaded = false;
+        for (const u of tessUrls) {
+          try {
+            await loadScript(u);
+            if (globalThis.Tesseract) {
+              loaded = true;
+              break;
+            }
+          } catch {
+            // try next mirror
+          }
+        }
+        if (!loaded || !globalThis.Tesseract) {
           alert("关键依赖加载失败：tesseract.js。\n请刷新重试或检查网络/浏览器扩展（可能拦截脚本）。");
           return;
         }
 
-        await loadScript("/app.js?v=pwa-mvp-0.2-amap-v7-ocr-pipeline");
+        await loadScript("/app.js?v=pwa-mvp-0.2-amap-v8-hybrid-ocr");
       })();
     </script>
   </body>
