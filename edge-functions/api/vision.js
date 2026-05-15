@@ -402,26 +402,16 @@ export default async function onRequest(context) {
     const model = String(modelFromKv || body?.model || "glm-4.6v").trim();
 
   const system = [
-    "你是旅行/探店/本地生活截图助手。必须同时完成「抄录可见文字」与「结构化 POI」，只输出 JSON（无 Markdown）。",
+    "你是截图 OCR + 地点结构化助手。第一优先级：把图中**所有可见汉字**抄进 text（保留换行），text 禁止为空。",
+    "第二优先级：从 text 抽取可地图搜索的 POI 到 places。只输出 JSON（无 Markdown）。",
     "JSON：{ title, city, interests, text, confidence, places[] }；Place={ categoryTags, name, road, district, addressHint, note, rawQuote }。",
-    "【text — 恢复完整抄录，禁止为空】",
-    "- 把图中与店名、地名、地址、路线、菜品、评论正文相关的**可见文字**尽量完整写入 text（保留换行）。",
-    "- 可删纯 UI 套话（点赞/关注/展开全文/直播中），但**不得**因「提炼」而整段留空。",
-    "- 手写便签/清单：逐行列出可见店名或标题行；无空格的长中文行可整行保留。",
-    "【places — 可地图检索的实体】",
-    "- name 必须是店名/景点/乡镇等可搜索实体；「土菜馆、火锅、简餐」等**栏目分类**只能进 categoryTags，不能作 name。",
-    "- 顿号/逗号/换行并列多店名 → 多条 places；清单尽量列全（≤24 条）。",
-    "- 路名写入 road/addressHint；rawQuote 为该店原文一句（≤80 字）。",
-    "- title≤26 字；city 无把握填「未知」；interests 1~4 个。",
+    "手写便签/菜单：逐行抄录；店名/码头/景点各一条 places；「川菜、凉菜」等栏目词仅进 categoryTags。",
+    "title≤26 字；city 无把握填「未知」；interests 1~4 个。",
     `- cityHint: ${cityHint || "(none)"}`,
     `- interestHint: ${interestHint || "(none)"}`
   ].join("\n");
 
-  const userText = [
-    "阅读截图：先抄录关键可见文字到 text，再从中抽取 places。",
-    "抖音/小红书评论里的路线（如某高速出口、某镇、某山）也写入 text，并尽量拆成 places。",
-    "只输出 JSON。"
-  ].join("\n");
+  const userText = ["请逐字抄录图中可见中文到 text，再输出 places。只输出 JSON。"].join("\n");
 
   const payload = {
     model,
@@ -484,8 +474,11 @@ export default async function onRequest(context) {
     return json({ error: "Model output is not valid JSON", model, content }, { status: 502 });
   }
 
-  const textRaw = typeof parsed.text === "string" ? parsed.text : "";
-  const text = textRaw.length > 12000 ? textRaw.slice(0, 12000) : textRaw;
+  let textRaw = typeof parsed.text === "string" ? parsed.text : "";
+  if (!textRaw.trim() && typeof content === "string" && content.length > 20 && content.length < 20000) {
+    textRaw = content;
+  }
+  let text = textRaw.length > 12000 ? textRaw.slice(0, 12000) : textRaw;
   const title = typeof parsed.title === "string" ? parsed.title.trim().slice(0, 40) : "";
   let city = typeof parsed.city === "string" ? parsed.city.trim().slice(0, 12) : "";
   if (!city || city === "未知" || city === "全部") {
@@ -601,6 +594,15 @@ export default async function onRequest(context) {
   for (const pl of places) for (const t of pl.categoryTags) if (t) tagSet.add(t);
   interests = Array.from(tagSet).slice(0, 8);
   if (!interests.length) interests = ["未分类"];
+
+  if (!String(text || "").trim()) {
+    const bits = [];
+    for (const pl of places) {
+      if (pl.name) bits.push(String(pl.name).trim());
+      if (pl.rawQuote) bits.push(String(pl.rawQuote).trim());
+    }
+    if (bits.length) text = [...new Set(bits.filter(Boolean))].join("\n").slice(0, 12000);
+  }
 
   const out = {
     title: title || (places[0]?.name ? String(places[0].name).slice(0, 40) : "截图收藏"),

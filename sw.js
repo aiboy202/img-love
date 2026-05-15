@@ -1,4 +1,4 @@
-const CACHE_NAME = "img-love-v23-vision-first";
+const CACHE_NAME = "img-love-v24-ocr-pipeline";
 const APP_SHELL = [
   "/",
   "/index.html",
