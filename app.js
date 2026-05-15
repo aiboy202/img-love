@@ -264,10 +264,6 @@ async function visionExtract(imageDataUrl, { cityHint, interestHint } = {}) {
   let url =
     (globalThis.__APP_CONFIG__ && typeof globalThis.__APP_CONFIG__.VISION_API_URL === "string" && globalThis.__APP_CONFIG__.VISION_API_URL.trim()) ||
     "/api/vision";
-  // 旧版页面或 SW 缓存的 index 曾指向错误函数子域名时，与当前 index 不一致会导致跨域/404；此处统一纠正为当前唯一视觉接口。
-  if (url.includes("1303863544-1ne8kwgln7.ap-guangzhou.tencentscf.com")) {
-    url = "https://1303863544-1t1wintitt.ap-guangzhou.tencentscf.com";
-  }
   // 腾讯云「函数 URL / tencentscf.com」一般根路径即函数，不要再拼 /api/vision。
   const isTencentScfUrl = /^https?:\/\//i.test(url) && /\.tencentscf\.com\b/i.test(url);
   if (
