@@ -373,6 +373,7 @@ function buildPlaceSearchKeyword(city, place) {
     place?.district || "",
     place?.road || "",
     place?.name || "",
+    place?.rawQuote || "",
     place?.addressHint || "",
     place?.note || ""
   ]
@@ -473,6 +474,12 @@ function isUsablePoiName(n) {
 function inferVenueNamesFromGuideBlob(text) {
   if (!text || typeof text !== "string") return [];
   let s = text.slice(0, 6000);
+  // 手写/笔记类「1. xxx」「2、xxx」行首编号，去掉后再分词，便于抽出店名
+  s = s
+    .split(/\r?\n/)
+    .map((line) => line.replace(/^\s*\d{1,3}\s*[\.\、．。:：\)）\]]\s*/, "").trim())
+    .filter(Boolean)
+    .join("\n");
   s = s.replace(/感兴趣的可以截图|展开+|共\d+人推荐\S*|美食指南|本地人去的馆子/gi, " ");
   s = s.replace(/>\s*\d+/g, " ");
   s = s.replace(/[@#＠]\w*/g, " ");
@@ -501,7 +508,8 @@ function inferVenueNamesFromGuideBlob(text) {
 
 function recoverPlacesFromVisionTextForClient(places, text, interests) {
   const inferred = inferVenueNamesFromGuideBlob(text);
-  if (inferred.length < 2) return places;
+  // 原先要求 ≥2 条才恢复，单店/短笔记会一直「检索词不足」
+  if (inferred.length === 0) return places;
 
   const goodRows = places.filter((p) => isUsablePoiName(p?.name));
   if (goodRows.length >= 3) return places;
@@ -578,7 +586,13 @@ function expandPlacesByNameEnumerationForItem(places) {
 }
 
 function placesFromVisionPayload(ai, fallbackCity) {
-  const city = typeof ai?.city === "string" && ai.city.trim() ? ai.city.trim() : fallbackCity || "未知";
+  let city = typeof ai?.city === "string" && ai.city.trim() ? ai.city.trim() : "";
+  const fb = typeof fallbackCity === "string" ? fallbackCity.trim() : "";
+  // 模型常返回「未知」占位；若用户在设置里选了城市，应参与高德检索
+  if (!city || city === "未知" || city === "全部") {
+    if (fb && fb !== "未知" && fb !== "全部") city = fb;
+  }
+  if (!city) city = "未知";
   const raw = Array.isArray(ai?.places) ? ai.places : [];
   const out = [];
   for (const p of raw) {

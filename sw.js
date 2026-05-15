@@ -1,4 +1,4 @@
-const CACHE_NAME = "img-love-v15-amap-probe";
+const CACHE_NAME = "img-love-v16-vision-kw";
 const APP_SHELL = [
   "/",
   "/index.html",
