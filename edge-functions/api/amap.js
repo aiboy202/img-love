@@ -109,6 +109,18 @@ async function readAmapKeyFromOneKv(kv) {
   return "";
 }
 
+/** 从 KV list 的单条记录中取键名（兼容 name / key 字段或字符串项） */
+function kvListEntryName(row) {
+  if (typeof row === "string") {
+    const s = row.trim();
+    return s || "";
+  }
+  if (!row || typeof row !== "object") return "";
+  if (typeof row.name === "string" && row.name.trim()) return row.name.trim();
+  if (typeof row.key === "string" && row.key.trim()) return row.key.trim();
+  return "";
+}
+
 /** probe 用：列出 KV 中已有键名（不含值），便于核对是否写错键名 */
 async function sampleKvKeyNames(kv, maxKeys) {
   if (!kv || typeof kv.list !== "function") return [];
@@ -120,8 +132,8 @@ async function sampleKvKeyNames(kv, maxKeys) {
       const page = await kv.list({ limit: Math.min(100, cap - names.length), ...(cursor ? { cursor } : {}) });
       const keys = Array.isArray(page?.keys) ? page.keys : [];
       for (const row of keys) {
-        const n = row?.name;
-        if (typeof n === "string" && n.trim()) names.push(n.trim());
+        const n = kvListEntryName(row);
+        if (n) names.push(n);
       }
       if (page?.list_complete || !page?.cursor) break;
       cursor = page.cursor;
@@ -356,6 +368,9 @@ export default async function onRequest(context) {
         if (bindingProbe.amapRestKeyPresentDirectGetInAnyKv) {
           fixHint =
             "探测到某命名空间内 AMAP_REST_KEY 可读，但聚合读取未成功（不应发生）；请重新部署最新 amap.js 或反馈。";
+        } else if (!bindingProbe.amapRestKeyPresentDirectGetInAnyKv && bindingProbe.bigmodelKeyPresentInAnyKv) {
+          fixHint =
+            "当前 KV 中**已有** BIGMODEL_API_KEY，但**没有**可用的 AMAP_REST_KEY。请在**同一 KV 命名空间**再新增一条：键名 **AMAP_REST_KEY**（区分大小写），值为高德「Web服务」Key；或在 Pages/Worker 环境变量里添加 AMAP_REST_KEY。";
         }
       }
       probe = {
