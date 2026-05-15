@@ -1,4 +1,4 @@
-const APP_VERSION = "pwa-mvp-0.2-amap-v4-ocrimg";
+const APP_VERSION = "pwa-mvp-0.2-amap-v5-salvage";
 
 const DEFAULT_SETTINGS = {
   ocrLang: "chi_sim",
@@ -260,6 +260,38 @@ async function semanticExtract(text) {
   return await res.json();
 }
 
+/**  unwrap 网关/误配探活响应 */
+function normalizeVisionExtractPayload(data) {
+  if (!data || typeof data !== "object") return data;
+  if (typeof data.body === "string") {
+    try {
+      return normalizeVisionExtractPayload(JSON.parse(data.body));
+    } catch {
+      return data;
+    }
+  }
+  if (data.body && typeof data.body === "object") return normalizeVisionExtractPayload(data.body);
+  if (data.service === "img_love/vision" && data.hint && !Array.isArray(data.places)) {
+    throw new Error(
+      "视觉接口返回的是 GET 探活 JSON，POST 未进入识别逻辑。请确认 VISION_API_URL 指向 vision 云函数根路径且已重新部署最新 scf/vision。"
+    );
+  }
+  return data;
+}
+
+function isPlaceholderPoiName(n) {
+  const t = typeof n === "string" ? n.trim() : "";
+  return !t || /^(未分类|未知|未命名|截图收藏?|未命名地点)$/.test(t);
+}
+
+function placesHaveSearchableKeyword(city, places) {
+  if (!Array.isArray(places)) return false;
+  return places.some((pl) => {
+    const kw = buildPlaceSearchKeyword(city, pl);
+    return kw.length >= 2;
+  });
+}
+
 async function visionExtract(imageDataUrl, { cityHint, interestHint } = {}) {
   let url =
     (globalThis.__APP_CONFIG__ && typeof globalThis.__APP_CONFIG__.VISION_API_URL === "string" && globalThis.__APP_CONFIG__.VISION_API_URL.trim()) ||
@@ -317,7 +349,7 @@ async function visionExtract(imageDataUrl, { cityHint, interestHint } = {}) {
     }
     throw new Error(`视觉识别接口失败：HTTP ${res.status}${detail}`);
   }
-  return await res.json();
+  return normalizeVisionExtractPayload(await res.json());
 }
 
 /**
@@ -368,11 +400,13 @@ function buildPlaceSearchKeyword(city, place) {
     const w = c.replace(/市$/u, "").trim();
     if (w.length >= 2) c = w;
   }
+  const nameRaw = typeof place?.name === "string" ? place.name.trim() : "";
+  const namePart = isPlaceholderPoiName(nameRaw) ? "" : nameRaw;
   const parts = [
     c,
     place?.district || "",
     place?.road || "",
-    place?.name || "",
+    namePart,
     place?.rawQuote || "",
     place?.addressHint || "",
     place?.note || ""
@@ -462,6 +496,7 @@ const GENERIC_NON_POI_NAMES = new Set(
 
 function isUsablePoiName(n) {
   const t = typeof n === "string" ? n.trim() : "";
+  if (isPlaceholderPoiName(t)) return false;
   if (t.length < 2 || t.length > 28) return false;
   if (PLACE_SECTION_HEADERS.has(t)) return false;
   if (GENERIC_NON_POI_NAMES.has(t)) return false;
@@ -516,7 +551,55 @@ function inferVenueNamesFromGuideBlob(text) {
       if (out.length >= 24) break;
     }
   }
+  if (!out.length) {
+    for (const chunk of s.split(/[，,。；;！!？?\n、：:]+/).map((x) => x.trim()).filter(Boolean)) {
+      if (chunk.length < 2 || chunk.length > 48) continue;
+      if (!isUsablePoiName(chunk)) continue;
+      if (seen.has(chunk)) continue;
+      seen.add(chunk);
+      out.push(chunk.slice(0, 80));
+      if (out.length >= 24) break;
+    }
+  }
+  if (!out.length) {
+    const geoRe = /[\u4e00-\u9fa5]{1,12}(?:镇|县|区|市|山|乡|村|岛|湖|湾|港|站|岭|谷|景区|国家公园)/g;
+    let m;
+    while ((m = geoRe.exec(text)) !== null) {
+      const t = m[0].trim();
+      if (t.length < 2 || t.length > 20) continue;
+      if (PLACE_SECTION_HEADERS.has(t) || GENERIC_NON_POI_NAMES.has(t)) continue;
+      if (seen.has(t)) continue;
+      seen.add(t);
+      out.push(t);
+      if (out.length >= 24) break;
+    }
+  }
   return out;
+}
+
+/** Vision/OCR 后仍无检索词时，从正文再捞一遍店名/地名 */
+function finalSalvagePlacesFromText(workAi, places, hintCity, interests) {
+  if (placesHaveSearchableKeyword(hintCity, places)) return { places, city: hintCity };
+  const text = typeof workAi?.text === "string" ? workAi.text : "";
+  const inferred = inferVenueNamesFromGuideBlob(text);
+  if (!inferred.length) return { places, city: hintCity };
+  const tagsBase = (Array.isArray(interests) ? interests : []).filter((x) => x && x !== "未分类").slice(0, 4);
+  const ct = tagsBase.length ? tagsBase : ["美食"];
+  return {
+    city: hintCity,
+    places: inferred.slice(0, 24).map((name) => ({
+      id: uid(),
+      categoryTags: [...ct].slice(0, 8),
+      name: name.slice(0, 80),
+      road: "",
+      district: "",
+      addressHint: "",
+      note: "",
+      rawQuote: "",
+      amap: null,
+      resolveStatus: "pending"
+    }))
+  };
 }
 
 function recoverPlacesFromVisionTextForClient(places, text, interests) {
@@ -943,6 +1026,11 @@ async function fileToJpegDataUrl(file, { maxDim = 1280, quality = 0.72 } = {}) {
   ctx.drawImage(img, 0, 0, tw, th);
 
   return canvas.toDataURL("image/jpeg", quality);
+}
+
+/** 本地 OCR 用更高分辨率，避免长截图小字被压糊 */
+async function fileToJpegDataUrlForOcr(file) {
+  return fileToJpegDataUrl(file, { maxDim: 1920, quality: 0.84 });
 }
 
 async function fileToJpegDataUrlUnderLimit(file, { byteLimit = 900_000 } = {}) {
@@ -1586,20 +1674,23 @@ async function importFiles(files) {
     if (!kwCity || kwCity === "未知" || kwCity === "全部") {
       if (hintCity && hintCity !== "未知" && hintCity !== "全部") kwCity = hintCity;
     }
-    const noSearchableKeyword =
-      !places.length || places.every((pl) => pl && typeof pl === "object" && !buildPlaceSearchKeyword(kwCity, pl));
     const visionTextLen = String(workAi.text || "").trim().length;
-    const allPlaceNamesEmpty = places.length && places.every((pl) => !String(pl?.name || "").trim());
-    const shouldLocalOcr = noSearchableKeyword || (visionTextLen < 20 && allPlaceNamesEmpty);
+    const shouldLocalOcr = !placesHaveSearchableKeyword(kwCity, places) || visionTextLen < 28;
     if (shouldLocalOcr) {
-      const src = typeof visionImage === "string" && visionImage.startsWith("data:") ? visionImage : file;
+      let ocrSrc = typeof visionImage === "string" && visionImage.startsWith("data:") ? visionImage : file;
+      try {
+        setProgress("本地 OCR 准备高清图", idx + 1, list.length);
+        ocrSrc = await withTimeout(fileToJpegDataUrlForOcr(file), 60_000, "OCR 用图");
+      } catch {
+        // 退回 vision 压缩图或原文件
+      }
       try {
         setProgress("本地 OCR 补全中", idx + 1, list.length);
         const primaryLang = state.settings.ocrLang || "chi_sim";
-        let ocrText = await ocrImage(src, { lang: primaryLang });
+        let ocrText = await ocrImage(ocrSrc, { lang: primaryLang });
         if (String(ocrText || "").trim().length < 18) {
           setProgress("本地 OCR（中英混合）", idx + 1, list.length);
-          const t2 = await ocrImage(src, { lang: "chi_sim+eng" });
+          const t2 = await ocrImage(ocrSrc, { lang: "chi_sim+eng" });
           if (String(t2 || "").trim().length > String(ocrText || "").trim().length) ocrText = t2;
         }
         const ot = String(ocrText || "").trim();
@@ -1615,6 +1706,15 @@ async function importFiles(files) {
         console.warn("本地 OCR 补全失败", e);
         els.progressText.textContent = `本地 OCR 失败：${String(e?.message || e).slice(0, 120)}`;
       }
+    }
+
+    const salvaged = finalSalvagePlacesFromText(workAi, places, hintCity, interests);
+    places = salvaged.places;
+    if (salvaged.city && salvaged.city !== "未知" && salvaged.city !== "全部") city = salvaged.city;
+    for (const pl of places) {
+      const kw = buildPlaceSearchKeyword(city, pl);
+      if (!kw) pl.resolveStatus = "empty";
+      else if (pl.resolveStatus === "empty") pl.resolveStatus = "pending";
     }
 
     text = typeof workAi.text === "string" ? workAi.text : text;

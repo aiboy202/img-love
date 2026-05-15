@@ -19,6 +19,26 @@ function serverError(message) {
   return json({ error: message }, { status: 500 });
 }
 
+function extractBigModelMessageContent(message) {
+  const c = message?.content;
+  if (typeof c === "string" && c.trim()) return c.trim();
+  if (Array.isArray(c)) {
+    return c
+      .map((part) => {
+        if (typeof part === "string") return part;
+        if (part && typeof part === "object" && part.type === "text" && part.text) return String(part.text);
+        return "";
+      })
+      .filter(Boolean)
+      .join("\n")
+      .trim();
+  }
+  if (typeof message?.reasoning_content === "string" && message.reasoning_content.trim()) {
+    return message.reasoning_content.trim();
+  }
+  return "";
+}
+
 function safeJsonParse(s) {
   if (typeof s !== "string") return null;
   let t = s.trim();
@@ -108,8 +128,14 @@ const GENERIC_NON_POI_NAMES = new Set(
   ["美食推荐", "餐厅推荐", "本地美食", "美食", "餐厅", "推荐", "攻略", "指南", "探店", "打卡", "必吃", "网红店"].map((s) => s.trim())
 );
 
+function isPlaceholderPoiName(n) {
+  const t = typeof n === "string" ? n.trim() : "";
+  return !t || /^(未分类|未知|未命名|截图收藏?|未命名地点)$/.test(t);
+}
+
 function isUsablePoiName(n) {
   const t = typeof n === "string" ? n.trim() : "";
+  if (isPlaceholderPoiName(t)) return false;
   if (t.length < 2 || t.length > 28) return false;
   if (PLACE_SECTION_HEADERS.has(t)) return false;
   if (GENERIC_NON_POI_NAMES.has(t)) return false;
@@ -164,6 +190,29 @@ function inferVenueNamesFromGuideBlob(text) {
       if (seen.has(u)) continue;
       seen.add(u);
       out.push(u.slice(0, 80));
+      if (out.length >= 24) break;
+    }
+  }
+  if (!out.length) {
+    for (const chunk of s.split(/[，,。；;！!？?\n、：:]+/).map((x) => x.trim()).filter(Boolean)) {
+      if (chunk.length < 2 || chunk.length > 48) continue;
+      if (!isUsablePoiName(chunk)) continue;
+      if (seen.has(chunk)) continue;
+      seen.add(chunk);
+      out.push(chunk.slice(0, 80));
+      if (out.length >= 24) break;
+    }
+  }
+  if (!out.length) {
+    const geoRe = /[\u4e00-\u9fa5]{1,12}(?:镇|县|区|市|山|乡|村|岛|湖|湾|港|站|岭|谷|景区|国家公园)/g;
+    let m;
+    while ((m = geoRe.exec(text)) !== null) {
+      const t = m[0].trim();
+      if (t.length < 2 || t.length > 20) continue;
+      if (PLACE_SECTION_HEADERS.has(t) || GENERIC_NON_POI_NAMES.has(t)) continue;
+      if (seen.has(t)) continue;
+      seen.add(t);
+      out.push(t);
       if (out.length >= 24) break;
     }
   }
@@ -440,8 +489,8 @@ export default async function onRequest(context) {
     return json({ error: "Upstream error", status: upstream.status, details: raw }, { status: 502 });
   }
 
-  const content = raw?.choices?.[0]?.message?.content;
-  const parsed = typeof content === "string" ? safeJsonParse(content) : null;
+  const content = extractBigModelMessageContent(raw?.choices?.[0]?.message);
+  const parsed = content ? safeJsonParse(content) : null;
   if (!parsed || typeof parsed !== "object") {
     return json({ error: "Model output is not valid JSON", model, content }, { status: 502 });
   }

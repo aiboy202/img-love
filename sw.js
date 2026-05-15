@@ -1,4 +1,4 @@
-const CACHE_NAME = "img-love-v19-appjs-query";
+const CACHE_NAME = "img-love-v20-salvage-v5";
 const APP_SHELL = [
   "/",
   "/index.html",
@@ -47,8 +47,8 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  // Always prefer network for app.js to avoid stale UI logic after deploys.
-  if (url.origin === self.location.origin && url.pathname === "/app.js") {
+  // Always prefer network for shell + app logic after deploys.
+  if (url.origin === self.location.origin && (url.pathname === "/app.js" || url.pathname === "/index.html")) {
     event.respondWith(
       (async () => {
         try {
