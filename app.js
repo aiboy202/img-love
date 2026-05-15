@@ -1,4 +1,4 @@
-const APP_VERSION = "pwa-mvp-0.2-amap-v6-hybrid-ocr";
+const APP_VERSION = "pwa-mvp-0.2-amap-v6-scf-vision";
 
 const DEFAULT_SETTINGS = {
   ocrLang: "chi_sim",
@@ -292,13 +292,36 @@ function placesHaveSearchableKeyword(city, places) {
   });
 }
 
-/** 视觉接口：未配置时用同域 /api/vision（EdgeOne Pages Function）；填完整 URL 则直连 SCF 等 */
-function resolveVisionApiUrl() {
-  const cfg =
-    globalThis.__APP_CONFIG__ && typeof globalThis.__APP_CONFIG__.VISION_API_URL === "string"
-      ? globalThis.__APP_CONFIG__.VISION_API_URL.trim()
+/** 视觉接口候选：主地址 + 可选备用（401/403 时自动切换） */
+function getVisionApiCandidates() {
+  const cfg = globalThis.__APP_CONFIG__ || {};
+  const primary =
+    typeof cfg.VISION_API_URL === "string" && cfg.VISION_API_URL.trim() ? cfg.VISION_API_URL.trim() : "";
+  const fallback =
+    typeof cfg.VISION_API_FALLBACK_URL === "string" && cfg.VISION_API_FALLBACK_URL.trim()
+      ? cfg.VISION_API_FALLBACK_URL.trim()
       : "";
-  return cfg || "/api/vision";
+  const out = [];
+  if (primary) out.push(primary);
+  if (fallback && fallback !== primary) out.push(fallback);
+  if (!out.length) out.push("/api/vision");
+  return out;
+}
+
+function normalizeVisionRequestUrl(base) {
+  let url = String(base || "").trim();
+  if (!url) return "/api/vision";
+  const isTencentScfUrl = /^https?:\/\//i.test(url) && /\.tencentscf\.com\b/i.test(url);
+  if (
+    url.startsWith("http") &&
+    !isTencentScfUrl &&
+    !url.includes("/api/") &&
+    !url.endsWith("/vision") &&
+    !url.endsWith("/api/vision")
+  ) {
+    url = url.replace(/\/+$/, "") + "/api/vision";
+  }
+  return url;
 }
 
 function mergeRecognitionText(visionText, ocrText) {
@@ -328,19 +351,7 @@ function normalizeOcrTextForChinese(text) {
     .join("\n");
 }
 
-async function visionExtract(imageDataUrl, { cityHint, interestHint } = {}) {
-  let url = resolveVisionApiUrl();
-  // 腾讯云「函数 URL / tencentscf.com」一般根路径即函数，不要再拼 /api/vision。
-  const isTencentScfUrl = /^https?:\/\//i.test(url) && /\.tencentscf\.com\b/i.test(url);
-  if (
-    url.startsWith("http") &&
-    !isTencentScfUrl &&
-    !url.includes("/api/") &&
-    !url.endsWith("/vision") &&
-    !url.endsWith("/api/vision")
-  ) {
-    url = url.replace(/\/+$/, "") + "/api/vision";
-  }
+async function visionExtractOnce(url, imageDataUrl, { cityHint, interestHint } = {}) {
   let res;
   try {
     res = await fetch(url, {
@@ -369,8 +380,9 @@ async function visionExtract(imageDataUrl, { cityHint, interestHint } = {}) {
   }
   if (!res.ok) {
     let detail = "";
+    let data = null;
     try {
-      const data = await res.json();
+      data = await res.json();
       detail = data?.error ? `：${data.error}` : "";
       if (data?.details) detail += `\n${JSON.stringify(data.details).slice(0, 1200)}`;
     } catch {
@@ -381,9 +393,46 @@ async function visionExtract(imageDataUrl, { cityHint, interestHint } = {}) {
         // ignore
       }
     }
-    throw new Error(`视觉识别接口失败：HTTP ${res.status}${detail}`);
+    const err = new Error(`视觉识别接口失败：HTTP ${res.status}${detail}`);
+    err.httpStatus = res.status;
+    err.requestUrl = url;
+    err.responseBody = data;
+    if (res.status === 401 || res.status === 403) {
+      const sameOrigin = (() => {
+        try {
+          return new URL(url).origin === globalThis.location?.origin;
+        } catch {
+          return false;
+        }
+      })();
+      if (sameOrigin) {
+        err.hint =
+          "同域 /api/vision 返回未授权（EdgeOne 常见）。请在 index.html 的 __APP_CONFIG__.VISION_API_URL 填写腾讯云 SCF 函数 URL（与此前可用时一致），或检查 Edge Function 是否已绑定 BIGMODEL_API_KEY。";
+      } else if (data?.status === 401 || /invalid|unauthorized|api.?key/i.test(JSON.stringify(data?.details || ""))) {
+        err.hint = "智谱 API Key 无效或过期。请在 SCF 环境变量或 KV 中更新 BIGMODEL_API_KEY。";
+      }
+    }
+    throw err;
   }
   return normalizeVisionExtractPayload(await res.json());
+}
+
+async function visionExtract(imageDataUrl, { cityHint, interestHint } = {}) {
+  const candidates = getVisionApiCandidates().map(normalizeVisionRequestUrl);
+  let lastErr = null;
+  for (let i = 0; i < candidates.length; i++) {
+    const url = candidates[i];
+    try {
+      return await visionExtractOnce(url, imageDataUrl, { cityHint, interestHint });
+    } catch (e) {
+      lastErr = e;
+      const st = e?.httpStatus;
+      const canRetry = (st === 401 || st === 403 || st === 404) && i < candidates.length - 1;
+      if (!canRetry) throw e;
+      console.warn(`Vision ${url} HTTP ${st}，尝试备用地址…`, e?.hint || "");
+    }
+  }
+  throw lastErr || new Error("视觉识别接口失败：无可用地址");
 }
 
 /**
