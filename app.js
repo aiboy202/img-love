@@ -1,4 +1,4 @@
-const APP_VERSION = "pwa-mvp-0.2-amap-v6-scf-vision";
+const APP_VERSION = "pwa-mvp-0.2-amap-v6-vision-first";
 
 const DEFAULT_SETTINGS = {
   ocrLang: "chi_sim",
@@ -1683,43 +1683,64 @@ function showProgress(show) {
   }
 }
 
-/** Vision + 本地 OCR 并行，合并正文（回归 2d45c42 之前「至少能读出字」的能力） */
+/** 本地 OCR 单独限时，避免拖垮整次导入（Tesseract 首载语言包可能很慢） */
+async function runLocalOcrWithCap(src, lang, capMs = 90_000) {
+  try {
+    return await withTimeout(
+      (async () => {
+        let t = await ocrImage(src, { lang }).catch(() => "");
+        if (String(t || "").trim().length < 12) {
+          const t2 = await ocrImage(src, { lang: "chi_sim+eng" }).catch(() => "");
+          if (String(t2 || "").trim().length > String(t || "").trim().length) t = t2;
+        }
+        return String(t || "").trim();
+      })(),
+      capMs,
+      "本地 OCR"
+    );
+  } catch {
+    return "";
+  }
+}
+
+/** 先 Vision（主路径），仅在结果弱时再限时 OCR — 勿与 OCR 并行等待（曾导致 240s 总超时） */
 async function recognizeScreenshotFile(file, { cityHint, interestHint } = {}, onPhase) {
   const visionImage = await withTimeout(fileToJpegDataUrlUnderLimit(file), 60_000, "压缩图片");
-  let ocrSrc = visionImage;
-  try {
-    ocrSrc = await withTimeout(fileToJpegDataUrlForOcr(file), 60_000, "OCR 用图");
-  } catch {
-    // 使用 vision 压缩图
+
+  if (typeof onPhase === "function") onPhase("AI 识别中");
+  const aiRaw = await withTimeout(
+    visionExtract(visionImage, { cityHint, interestHint }),
+    150_000,
+    "AI 识别"
+  );
+  const ai = aiRaw && typeof aiRaw === "object" ? { ...aiRaw } : {};
+
+  const hint = cityHint && cityHint !== "全部" ? cityHint : typeof ai.city === "string" ? ai.city : "未知";
+  let { places, city: parsedCity } = placesFromVisionPayload(ai, hint);
+  let kwCity = parsedCity || hint;
+  if (!kwCity || kwCity === "未知" || kwCity === "全部") {
+    kwCity = cityHint && cityHint !== "未知" && cityHint !== "全部" ? cityHint : "";
   }
 
-  const lang = state.settings.ocrLang || "chi_sim";
-  if (typeof onPhase === "function") onPhase("AI 与本地 OCR 并行识别");
+  let ocrText = "";
+  const needOcr =
+    !placesHaveSearchableKeyword(kwCity || hint, places) || String(ai.text || "").trim().length < 28;
 
-  const visionP = visionExtract(visionImage, { cityHint, interestHint });
-  const ocrP = ocrImage(ocrSrc, { lang }).catch(() => "");
-
-  const [vr, or] = await Promise.allSettled([visionP, ocrP]);
-  if (vr.status !== "fulfilled") throw vr.reason;
-
-  const ai = vr.value && typeof vr.value === "object" ? vr.value : {};
-  let ocrText = or.status === "fulfilled" ? String(or.value || "").trim() : "";
-
-  if (ocrText.length < 16) {
+  if (needOcr) {
+    if (typeof onPhase === "function") onPhase("本地 OCR 补全（限时）");
+    let ocrSrc = visionImage;
     try {
-      const t2 = await ocrImage(ocrSrc, { lang: "chi_sim+eng" });
-      if (String(t2 || "").trim().length > ocrText.length) ocrText = String(t2).trim();
+      ocrSrc = await withTimeout(fileToJpegDataUrlForOcr(file), 45_000, "OCR 用图");
     } catch {
-      // ignore
+      // 使用 vision 压缩图
+    }
+    ocrText = await runLocalOcrWithCap(ocrSrc, state.settings.ocrLang || "chi_sim", 90_000);
+    if (ocrText) {
+      ai.text = mergeRecognitionText(typeof ai.text === "string" ? ai.text : "", ocrText);
     }
   }
 
-  const mergedText = mergeRecognitionText(typeof ai.text === "string" ? ai.text : "", ocrText);
-  return {
-    ai: { ...ai, text: mergedText },
-    visionImage,
-    ocrText
-  };
+  return { ai, visionImage, ocrText };
 }
 
 async function importFiles(files) {
@@ -1759,17 +1780,13 @@ async function importFiles(files) {
       setProgress("AI 识别中", idx + 1, list.length);
       els.progressBar.style.width = "10%";
 
-      const rec = await withTimeout(
-        recognizeScreenshotFile(
-          file,
-          {
-            cityHint: state.settings.currentCity && state.settings.currentCity !== "全部" ? state.settings.currentCity : "",
-            interestHint: state.activeInterest && state.activeInterest !== "全部" ? state.activeInterest : ""
-          },
-          (phase) => setProgress(phase, idx + 1, list.length)
-        ),
-        240_000,
-        "识别截图"
+      const rec = await recognizeScreenshotFile(
+        file,
+        {
+          cityHint: state.settings.currentCity && state.settings.currentCity !== "全部" ? state.settings.currentCity : "",
+          interestHint: state.activeInterest && state.activeInterest !== "全部" ? state.activeInterest : ""
+        },
+        (phase) => setProgress(phase, idx + 1, list.length)
       );
       ai = rec.ai;
       visionImage = rec.visionImage;
