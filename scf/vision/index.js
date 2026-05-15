@@ -50,7 +50,11 @@ function expandPlacesByNameEnumeration(places) {
   const out = [];
   for (const pl of places) {
     const name = typeof pl.name === "string" ? pl.name.trim() : "";
-    if (!name) continue;
+    // 勿丢弃 name 为空的行：模型常返回占位对象；若 continue 会把 [ { name: "" } ] 展成 []，后续无法从 text 救回
+    if (!name) {
+      out.push({ ...pl, name: "" });
+      continue;
+    }
     if (!PLACE_NAME_ENUM_SPLIT.test(name)) {
       if (!PLACE_SECTION_HEADERS.has(name)) out.push({ ...pl, name: name.slice(0, 80) });
       continue;
@@ -93,6 +97,11 @@ function reEscapeForRegex(s) {
 function inferVenueNamesFromGuideBlob(text) {
   if (!text || typeof text !== "string") return [];
   let s = text.slice(0, 6000);
+  s = s
+    .split(/\r?\n/)
+    .map((line) => line.replace(/^\s*\d{1,3}\s*[\.\、．。:：\)）\]]\s*/, "").trim())
+    .filter(Boolean)
+    .join("\n");
   s = s.replace(/感兴趣的可以截图|展开+|共\d+人推荐\S*|美食指南|本地人去的馆子/gi, " ");
   s = s.replace(/>\s*\d+/g, " ");
   s = s.replace(/[@#＠]\w*/g, " ");
@@ -121,7 +130,7 @@ function inferVenueNamesFromGuideBlob(text) {
 
 function recoverPlacesFromTextWhenModelWeak(places, text, interests) {
   const inferred = inferVenueNamesFromGuideBlob(text);
-  if (inferred.length < 2) return places;
+  if (inferred.length === 0) return places;
 
   const goodRows = places.filter((p) => isUsablePoiName(p?.name));
   if (goodRows.length >= 3) return places;
@@ -399,7 +408,10 @@ async function handleVision(event) {
   const textRaw = typeof parsed.text === "string" ? parsed.text : "";
   const text = textRaw.length > 12000 ? textRaw.slice(0, 12000) : textRaw;
   const title = typeof parsed.title === "string" ? parsed.title.trim().slice(0, 40) : "";
-  let city = typeof parsed.city === "string" ? parsed.city.trim().slice(0, 12) : "未知";
+  let city = typeof parsed.city === "string" ? parsed.city.trim().slice(0, 12) : "";
+  if (!city || city === "未知" || city === "全部") {
+    if (cityHint && cityHint !== "未知" && cityHint !== "全部") city = cityHint.slice(0, 12);
+  }
   if (!city) city = "未知";
 
   let interests = Array.isArray(parsed.interests)
@@ -444,6 +456,67 @@ async function handleVision(event) {
 
   places = expandPlacesByNameEnumeration(places).slice(0, 24);
   places = recoverPlacesFromTextWhenModelWeak(places, text, interests).slice(0, 24);
+
+  if (!places.length) {
+    const firstLine =
+      typeof text === "string"
+        ? text
+            .split(/\r?\n/)
+            .map((l) => l.trim())
+            .find((l) => l.length >= 2 && l.length <= 80) || ""
+        : "";
+    const tags = interests.filter((x) => x && x !== "未分类" && x !== "未知");
+    places.push({
+      categoryTags: tags.length ? tags.slice(0, 4) : ["未分类"],
+      name: legacyPoi || title || firstLine,
+      road: "",
+      district: "",
+      addressHint: legacyAddress,
+      note: "",
+      rawQuote: firstLine && !legacyPoi && !title ? firstLine.slice(0, 120) : ""
+    });
+  }
+
+  const allNamesMissing = places.length > 0 && places.every((p) => !String(p?.name || "").trim());
+  if (allNamesMissing) {
+    const inferred2 = inferVenueNamesFromGuideBlob(text);
+    const tags0 =
+      Array.isArray(places[0]?.categoryTags) && places[0].categoryTags.length
+        ? places[0].categoryTags
+        : interests.filter((x) => x && x !== "未分类" && x !== "未知").length
+          ? interests.slice(0, 4)
+          : ["未分类"];
+    if (inferred2.length) {
+      places = inferred2.slice(0, 24).map((name) => ({
+        categoryTags: [...tags0].slice(0, 6),
+        name: name.slice(0, 80),
+        road: "",
+        district: "",
+        addressHint: "",
+        note: "",
+        rawQuote: ""
+      }));
+    } else {
+      const rq = String(places[0]?.rawQuote || "").trim();
+      const ah = String(places[0]?.addressHint || "").trim();
+      if (rq) places = [{ ...places[0], name: rq.slice(0, 80) }];
+      else if (ah) places = [{ ...places[0], name: ah.slice(0, 80) }];
+      else {
+        const salvageLine =
+          typeof text === "string"
+            ? text
+                .split(/\r?\n/)
+                .map((l) => l.trim())
+                .find((l) => l.length >= 2 && l.length <= 80) || ""
+            : "";
+        if (salvageLine) places = [{ ...places[0], name: salvageLine.slice(0, 80) }];
+        else {
+          const lp = String(legacyPoi || "").trim();
+          if (lp) places = [{ ...places[0], name: lp.slice(0, 80) }];
+        }
+      }
+    }
+  }
 
   const tagSet = new Set(interests);
   for (const pl of places) for (const t of pl.categoryTags) if (t) tagSet.add(t);
