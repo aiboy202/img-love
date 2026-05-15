@@ -216,6 +216,18 @@ function inferVenueNamesFromGuideBlob(text) {
       if (out.length >= 24) break;
     }
   }
+  if (!out.length) {
+    const shopRe = /[\u4e00-\u9fa5]{2,14}(?:店|馆|餐厅|酒楼|面馆|小吃|火锅|烧烤|咖啡|奶茶|料理|食堂)/g;
+    let m;
+    while ((m = shopRe.exec(text)) !== null) {
+      const t = m[0].trim();
+      if (!isUsablePoiName(t)) continue;
+      if (seen.has(t)) continue;
+      seen.add(t);
+      out.push(t);
+      if (out.length >= 24) break;
+    }
+  }
   return out;
 }
 
@@ -224,7 +236,7 @@ function recoverPlacesFromTextWhenModelWeak(places, text, interests) {
   if (inferred.length === 0) return places;
 
   const goodRows = places.filter((p) => isUsablePoiName(p?.name));
-  if (goodRows.length >= 3) return places;
+  if (goodRows.length >= 3 && goodRows.every((p) => String(p?.name || "").trim().length >= 2)) return places;
 
   const tagsBase = interests.filter((x) => x && x !== "未分类").slice(0, 4);
   const ct = tagsBase.length ? tagsBase : ["美食"];
@@ -390,54 +402,31 @@ export default async function onRequest(context) {
     const model = String(modelFromKv || body?.model || "glm-4.6v").trim();
 
   const system = [
-    "你是「旅行/探店/本地生活」截图的结构化理解助手，不是简单 OCR 抄写员。",
-    "输入是一张截图（常见：抖音/小红书/大众点评/地图/备忘录）。你要结合**版面、字号、位置条、地图钉、话题标签**与正文，做**语义理解、信息提炼与噪声过滤**，再输出 JSON。",
-    "必须只输出 JSON（不要 Markdown，不要解释）。",
-    "JSON 结构固定为：",
-    '{ "title": string, "city": string, "interests": string[], "text": string, "confidence": number, "places": Place[] }',
-    "其中 Place = {",
-    '  "categoryTags": string[],',
-    '  "name": string,',
-    '  "road": string,',
-    '  "district": string,',
-    '  "addressHint": string,',
-    '  "note": string,',
-    '  "rawQuote": string',
-    "}",
-    "【提炼与过滤（重要）】",
-    "- text：**禁止**输出空字符串。经提炼的同时，若为手写/备忘录/编号清单，必须把图中**可见店名或标题行**逐行写入 text（可去 UI 套话与无关 hashtag）；无空格的长中文行可整行保留一行。其余类型仍去掉无意义 UI 文案，保留店名/地址/人均/营业时间等对检索有用的信息；约 1200 字内。",
-    "- title：<=26 字，用**具体主题**概括（例如“杭州某店｜排队与必点”），不要用“截图”“抖音”等空泛词。",
-    "- city：从正文/定位条/话题/地图信息综合判断；无把握填“未知”。若与 cityHint 冲突，以截图证据为准。",
-    "- interests：全文层面 1~4 个兴趣标签；与 categoryTags 可重叠；无把握用 [\"未分类\"]。",
-    "【places：可检索 POI；便签清单要「拆店」】",
-    "- 每个元素对应**可在地图/点评里检索的命名实体**：餐厅/咖啡馆/景点/乐园/酒店/商场内具体店铺名等。",
-    "- **严禁**把「土菜馆、简餐、川菜和鱼」等**仅为分类/栏目**的词作为任意 place 的 **name**（地图搜不到、无意义）；它们只能出现在 **categoryTags** 或 interests。",
-    "- **抖音/小红书常见「便利贴 + 分类 + 多家店」**：如「土菜馆」下列「老盐渎、华燕土菜」，**分类词只写入 categoryTags（或 interests），不要作为 name**；**每个店名必须单独一条 places**，不得只输出第一个店名。",
-    "- 同一行用 **顿号、逗号、分号、换行** 并列多个店名时，必须输出**多条** places（例：「香辣川味王、谢师傅、川江鱼、本素」→ 4 条）。",
-    "- 「宁精勿滥」指过滤**界面噪声/UI 套话**，不是省略便签里**已写明的真实店名**；此类截图应在 24 条上限内**尽量列全**可见店名。",
-    "- 不要把**单独一条路名**当成一个 place（除非截图主旨就是该路段导航且无法落到具体 POI）。路名应写入对应 POI 的 road 或 addressHint。",
-    "- 同一店/景点在正文里多次出现：合并为**一条** place，把补充信息写入 note/addressHint。",
-    "- categoryTags：该地点类型 1~4 个（美食餐厅、咖啡甜品、旅游景点、酒店民宿、购物、拍照机位、交通攻略等）。",
-    "- name：尽量标准店名/景点官方名；只有昵称时写昵称并在 note 说明。",
-    "- road / district / addressHint：能拆则拆，便于后续地图检索。",
-    "- note：人均、排队、预约、营业时间摘要、套餐关键词等短信息。",
-    "- rawQuote：**一句**最能支撑该 place 的原文摘录（<=80 字），不要整段营销长文。",
-    "- confidence：0~1，对「提炼是否正确、地点是否可靠」的综合自信度。",
-    "你可能会得到这些提示：",
+    "你是旅行/探店/本地生活截图助手。必须同时完成「抄录可见文字」与「结构化 POI」，只输出 JSON（无 Markdown）。",
+    "JSON：{ title, city, interests, text, confidence, places[] }；Place={ categoryTags, name, road, district, addressHint, note, rawQuote }。",
+    "【text — 恢复完整抄录，禁止为空】",
+    "- 把图中与店名、地名、地址、路线、菜品、评论正文相关的**可见文字**尽量完整写入 text（保留换行）。",
+    "- 可删纯 UI 套话（点赞/关注/展开全文/直播中），但**不得**因「提炼」而整段留空。",
+    "- 手写便签/清单：逐行列出可见店名或标题行；无空格的长中文行可整行保留。",
+    "【places — 可地图检索的实体】",
+    "- name 必须是店名/景点/乡镇等可搜索实体；「土菜馆、火锅、简餐」等**栏目分类**只能进 categoryTags，不能作 name。",
+    "- 顿号/逗号/换行并列多店名 → 多条 places；清单尽量列全（≤24 条）。",
+    "- 路名写入 road/addressHint；rawQuote 为该店原文一句（≤80 字）。",
+    "- title≤26 字；city 无把握填「未知」；interests 1~4 个。",
     `- cityHint: ${cityHint || "(none)"}`,
     `- interestHint: ${interestHint || "(none)"}`
   ].join("\n");
 
   const userText = [
-    "请阅读整张截图：先判断内容类型（探店/攻略/地图/纯文字/分类便签清单），再做去噪与信息提炼，最后按 JSON 结构输出。",
-    "若为「分类标题 + 多店名」清单：每个店名各一条 places；分类进 categoryTags；并列店名勿合并成一条。",
-    "注意：只输出 JSON；text 须含对检索有用的可见文字，**不得整段为空**；提炼与「逐行列出清单文字」可同时满足。"
+    "阅读截图：先抄录关键可见文字到 text，再从中抽取 places。",
+    "抖音/小红书评论里的路线（如某高速出口、某镇、某山）也写入 text，并尽量拆成 places。",
+    "只输出 JSON。"
   ].join("\n");
 
   const payload = {
     model,
     stream: false,
-    temperature: 0.28,
+    temperature: 0.22,
     messages: [
       { role: "system", content: system },
       {

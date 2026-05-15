@@ -307,9 +307,10 @@
        * - 已是完整路径（含 /api/amap 或其它 path）→ 原样使用
        * 详见首页「网关与 AMAP_API_URL 配置说明」。
        */
-      /* 视觉接口须与腾讯云当前「函数 URL」完全一致。若线上仍请求旧子域名，多为 Service Worker 缓存了旧 index：部署后硬刷新或清除本站数据；本次已提升 sw.js 的 CACHE_NAME。 */
+      /* VISION_API_URL 留空 → 同域 /api/vision（EdgeOne Pages Function，与 amap 共用 KV）。
+         若要用腾讯云 SCF 直连，再填完整函数 URL。 */
       globalThis.__APP_CONFIG__ = {
-        VISION_API_URL: "https://1303863544-40epze5as1.ap-guangzhou.tencentscf.com",
+        VISION_API_URL: "",
         AMAP_API_URL: ""
       };
 
@@ -334,7 +335,7 @@
           return;
         }
 
-        await loadScript("/app.js?v=pwa-mvp-0.2-amap-v5-salvage");
+        await loadScript("/app.js?v=pwa-mvp-0.2-amap-v6-hybrid-ocr");
       })();
     </script>
   </body>

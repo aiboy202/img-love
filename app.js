@@ -1,4 +1,4 @@
-const APP_VERSION = "pwa-mvp-0.2-amap-v5-salvage";
+const APP_VERSION = "pwa-mvp-0.2-amap-v6-hybrid-ocr";
 
 const DEFAULT_SETTINGS = {
   ocrLang: "chi_sim",
@@ -292,10 +292,44 @@ function placesHaveSearchableKeyword(city, places) {
   });
 }
 
+/** 视觉接口：未配置时用同域 /api/vision（EdgeOne Pages Function）；填完整 URL 则直连 SCF 等 */
+function resolveVisionApiUrl() {
+  const cfg =
+    globalThis.__APP_CONFIG__ && typeof globalThis.__APP_CONFIG__.VISION_API_URL === "string"
+      ? globalThis.__APP_CONFIG__.VISION_API_URL.trim()
+      : "";
+  return cfg || "/api/vision";
+}
+
+function mergeRecognitionText(visionText, ocrText) {
+  const v = typeof visionText === "string" ? visionText.trim() : "";
+  let o = typeof ocrText === "string" ? ocrText.trim() : "";
+  if (o) o = normalizeOcrTextForChinese(o);
+  if (!v && !o) return "";
+  if (!v) return o;
+  if (!o) return v;
+  if (o.length > 40 && v.includes(o.slice(0, Math.min(80, o.length)))) return v;
+  if (v.length > 40 && o.includes(v.slice(0, Math.min(80, v.length)))) return o;
+  return `${v}\n\n--- 本地 OCR ---\n\n${o}`;
+}
+
+/** OCR 常插入空格，合并连续中文便于抽店名 */
+function normalizeOcrTextForChinese(text) {
+  if (!text || typeof text !== "string") return "";
+  return text
+    .split(/\r?\n/)
+    .map((line) => {
+      const cjk = (line.match(/[\u4e00-\u9fff]/g) || []).length;
+      if (cjk >= 4 && cjk >= line.replace(/\s/g, "").length * 0.45) {
+        return line.replace(/\s+/g, "");
+      }
+      return line;
+    })
+    .join("\n");
+}
+
 async function visionExtract(imageDataUrl, { cityHint, interestHint } = {}) {
-  let url =
-    (globalThis.__APP_CONFIG__ && typeof globalThis.__APP_CONFIG__.VISION_API_URL === "string" && globalThis.__APP_CONFIG__.VISION_API_URL.trim()) ||
-    "/api/vision";
+  let url = resolveVisionApiUrl();
   // 腾讯云「函数 URL / tencentscf.com」一般根路径即函数，不要再拼 /api/vision。
   const isTencentScfUrl = /^https?:\/\//i.test(url) && /\.tencentscf\.com\b/i.test(url);
   if (
@@ -508,6 +542,7 @@ function isUsablePoiName(n) {
 
 function inferVenueNamesFromGuideBlob(text) {
   if (!text || typeof text !== "string") return [];
+  text = normalizeOcrTextForChinese(text);
   let s = text.slice(0, 6000);
   // 手写/笔记类「1. xxx」「2、xxx」行首编号，去掉后再分词，便于抽出店名
   s = s
@@ -574,6 +609,18 @@ function inferVenueNamesFromGuideBlob(text) {
       if (out.length >= 24) break;
     }
   }
+  if (!out.length) {
+    const shopRe = /[\u4e00-\u9fa5]{2,14}(?:店|馆|餐厅|酒楼|面馆|小吃|火锅|烧烤|咖啡|奶茶|料理|食堂)/g;
+    let m;
+    while ((m = shopRe.exec(text)) !== null) {
+      const t = m[0].trim();
+      if (!isUsablePoiName(t)) continue;
+      if (seen.has(t)) continue;
+      seen.add(t);
+      out.push(t);
+      if (out.length >= 24) break;
+    }
+  }
   return out;
 }
 
@@ -604,11 +651,11 @@ function finalSalvagePlacesFromText(workAi, places, hintCity, interests) {
 
 function recoverPlacesFromVisionTextForClient(places, text, interests) {
   const inferred = inferVenueNamesFromGuideBlob(text);
-  // 原先要求 ≥2 条才恢复，单店/短笔记会一直「检索词不足」
   if (inferred.length === 0) return places;
 
   const goodRows = places.filter((p) => isUsablePoiName(p?.name));
-  if (goodRows.length >= 3) return places;
+  // 2d45c42 后模型常只给空 places；只要还拼不出检索词，就用正文推断结果覆盖/补全
+  if (goodRows.length >= 3 && placesHaveSearchableKeyword("", goodRows)) return places;
 
   const tagsBase = interests.filter((x) => x && x !== "未分类").slice(0, 4);
   const ct = tagsBase.length ? tagsBase : ["美食"];
@@ -1587,6 +1634,45 @@ function showProgress(show) {
   }
 }
 
+/** Vision + 本地 OCR 并行，合并正文（回归 2d45c42 之前「至少能读出字」的能力） */
+async function recognizeScreenshotFile(file, { cityHint, interestHint } = {}, onPhase) {
+  const visionImage = await withTimeout(fileToJpegDataUrlUnderLimit(file), 60_000, "压缩图片");
+  let ocrSrc = visionImage;
+  try {
+    ocrSrc = await withTimeout(fileToJpegDataUrlForOcr(file), 60_000, "OCR 用图");
+  } catch {
+    // 使用 vision 压缩图
+  }
+
+  const lang = state.settings.ocrLang || "chi_sim";
+  if (typeof onPhase === "function") onPhase("AI 与本地 OCR 并行识别");
+
+  const visionP = visionExtract(visionImage, { cityHint, interestHint });
+  const ocrP = ocrImage(ocrSrc, { lang }).catch(() => "");
+
+  const [vr, or] = await Promise.allSettled([visionP, ocrP]);
+  if (vr.status !== "fulfilled") throw vr.reason;
+
+  const ai = vr.value && typeof vr.value === "object" ? vr.value : {};
+  let ocrText = or.status === "fulfilled" ? String(or.value || "").trim() : "";
+
+  if (ocrText.length < 16) {
+    try {
+      const t2 = await ocrImage(ocrSrc, { lang: "chi_sim+eng" });
+      if (String(t2 || "").trim().length > ocrText.length) ocrText = String(t2).trim();
+    } catch {
+      // ignore
+    }
+  }
+
+  const mergedText = mergeRecognitionText(typeof ai.text === "string" ? ai.text : "", ocrText);
+  return {
+    ai: { ...ai, text: mergedText },
+    visionImage,
+    ocrText
+  };
+}
+
 async function importFiles(files) {
   const list = Array.from(files || []).filter(Boolean);
   if (list.length === 0) {
@@ -1621,25 +1707,25 @@ async function importFiles(files) {
     let ai = null;
     let visionImage = "";
     try {
-      // High-cost / high-quality mode: use BigModel vision to do OCR + semantic in one pass.
       setProgress("AI 识别中", idx + 1, list.length);
       els.progressBar.style.width = "10%";
 
-      visionImage = await withTimeout(fileToJpegDataUrlUnderLimit(file), 60_000, "压缩图片");
-      els.progressBar.style.width = "25%";
-
-      ai = await withTimeout(
-        visionExtract(visionImage, {
-          cityHint: state.settings.currentCity && state.settings.currentCity !== "全部" ? state.settings.currentCity : "",
-          interestHint: state.activeInterest && state.activeInterest !== "全部" ? state.activeInterest : ""
-        }),
-        180_000,
-        "AI 识别"
+      const rec = await withTimeout(
+        recognizeScreenshotFile(
+          file,
+          {
+            cityHint: state.settings.currentCity && state.settings.currentCity !== "全部" ? state.settings.currentCity : "",
+            interestHint: state.activeInterest && state.activeInterest !== "全部" ? state.activeInterest : ""
+          },
+          (phase) => setProgress(phase, idx + 1, list.length)
+        ),
+        240_000,
+        "识别截图"
       );
+      ai = rec.ai;
+      visionImage = rec.visionImage;
       els.progressBar.style.width = "85%";
-
       text = typeof ai?.text === "string" ? ai.text : "";
-      // 后续若触发本地 OCR 补全，会覆盖 text
     } catch (e) {
       showProgress(false);
       const msg = String(e?.message || e || "未知错误");
@@ -1674,40 +1760,6 @@ async function importFiles(files) {
     if (!kwCity || kwCity === "未知" || kwCity === "全部") {
       if (hintCity && hintCity !== "未知" && hintCity !== "全部") kwCity = hintCity;
     }
-    const visionTextLen = String(workAi.text || "").trim().length;
-    const shouldLocalOcr = !placesHaveSearchableKeyword(kwCity, places) || visionTextLen < 28;
-    if (shouldLocalOcr) {
-      let ocrSrc = typeof visionImage === "string" && visionImage.startsWith("data:") ? visionImage : file;
-      try {
-        setProgress("本地 OCR 准备高清图", idx + 1, list.length);
-        ocrSrc = await withTimeout(fileToJpegDataUrlForOcr(file), 60_000, "OCR 用图");
-      } catch {
-        // 退回 vision 压缩图或原文件
-      }
-      try {
-        setProgress("本地 OCR 补全中", idx + 1, list.length);
-        const primaryLang = state.settings.ocrLang || "chi_sim";
-        let ocrText = await ocrImage(ocrSrc, { lang: primaryLang });
-        if (String(ocrText || "").trim().length < 18) {
-          setProgress("本地 OCR（中英混合）", idx + 1, list.length);
-          const t2 = await ocrImage(ocrSrc, { lang: "chi_sim+eng" });
-          if (String(t2 || "").trim().length > String(ocrText || "").trim().length) ocrText = t2;
-        }
-        const ot = String(ocrText || "").trim();
-        if (ot) {
-          workAi.text = [typeof workAi.text === "string" ? workAi.text : "", ocrText].filter((x) => String(x || "").trim()).join("\n\n");
-          const r2 = placesFromVisionPayload(workAi, hintCity);
-          places = r2.places;
-          if (r2.city && r2.city !== "未知" && r2.city !== "全部") city = r2.city;
-        } else {
-          els.progressText.textContent = `本地 OCR 未识别到文字（${idx + 1}/${list.length}）· 可在设置换语言或换更清晰的截图`;
-        }
-      } catch (e) {
-        console.warn("本地 OCR 补全失败", e);
-        els.progressText.textContent = `本地 OCR 失败：${String(e?.message || e).slice(0, 120)}`;
-      }
-    }
-
     const salvaged = finalSalvagePlacesFromText(workAi, places, hintCity, interests);
     places = salvaged.places;
     if (salvaged.city && salvaged.city !== "未知" && salvaged.city !== "全部") city = salvaged.city;

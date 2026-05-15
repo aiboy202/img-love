@@ -210,6 +210,18 @@ function inferVenueNamesFromGuideBlob(text) {
       if (out.length >= 24) break;
     }
   }
+  if (!out.length) {
+    const shopRe = /[\u4e00-\u9fa5]{2,14}(?:店|馆|餐厅|酒楼|面馆|小吃|火锅|烧烤|咖啡|奶茶|料理|食堂)/g;
+    let m;
+    while ((m = shopRe.exec(text)) !== null) {
+      const t = m[0].trim();
+      if (!isUsablePoiName(t)) continue;
+      if (seen.has(t)) continue;
+      seen.add(t);
+      out.push(t);
+      if (out.length >= 24) break;
+    }
+  }
   return out;
 }
 
@@ -218,7 +230,7 @@ function recoverPlacesFromTextWhenModelWeak(places, text, interests) {
   if (inferred.length === 0) return places;
 
   const goodRows = places.filter((p) => isUsablePoiName(p?.name));
-  if (goodRows.length >= 3) return places;
+  if (goodRows.length >= 3 && goodRows.every((p) => String(p?.name || "").trim().length >= 2)) return places;
 
   const tagsBase = interests.filter((x) => x && x !== "未分类").slice(0, 4);
   const ct = tagsBase.length ? tagsBase : ["美食"];
@@ -363,7 +375,7 @@ async function handleVision(event) {
       {
         ok: true,
         service: "img_love/vision",
-        revision: "2026-05-15-content-array-geo",
+        revision: "2026-05-15-hybrid-ocr-parallel",
         hint: "POST JSON：{ imageDataUrl, cityHint?, interestHint?, model? }；需配置 BIGMODEL_API_KEY"
       },
       event
@@ -400,46 +412,31 @@ async function handleVision(event) {
   const model = String(process.env.BIGMODEL_VISION_MODEL || body?.model || DEFAULT_VISION_MODEL).trim();
 
   const system = [
-    "你是「旅行/探店/本地生活」截图的结构化理解助手，不是简单 OCR 抄写员。",
-    "输入是一张截图（常见：抖音/小红书/大众点评/地图/备忘录）。你要结合**版面、字号、位置条、地图钉、话题标签**与正文，做**语义理解、信息提炼与噪声过滤**，再输出 JSON。",
-    "必须只输出 JSON（不要 Markdown，不要解释）。",
-    "JSON 结构固定为：",
-    '{ "title": string, "city": string, "interests": string[], "text": string, "confidence": number, "places": Place[] }',
-    "其中 Place = {",
-    '  "categoryTags": string[],',
-    '  "name": string,',
-    '  "road": string,',
-    '  "district": string,',
-    '  "addressHint": string,',
-    '  "note": string,',
-    '  "rawQuote": string',
-    "}",
-    "【提炼与过滤】",
-    "- text：**禁止**输出空字符串。手写/备忘录/编号清单必须把图中**可见店名或标题行**逐行写入 text（可轻度去噪），否则无法地图检索；约 1200 字内。",
-    "- title：<=26 字，具体主题，避免“截图/抖音”等空泛词。",
-    "- city：综合判断；无把握填“未知”。",
-    "- interests：1~4 个；无把握 [\"未分类\"]。",
-    "【places】",
-    "- 每条对应可地图检索的命名实体；路名写入 road/addressHint，不要单独当一条路一个 place。",
-    "- **严禁**把「土菜馆、简餐、川菜和鱼」等**仅为分类/栏目**的词作为任意 place 的 **name**；它们只能进 categoryTags。",
-    "- **便利贴/清单「分类 + 多店」**：分类词只进 categoryTags；**每个店名单独一条**；顿号/逗号并列多名必须拆成多条，勿只保留第一个。",
-    "- 同一店合并一条；rawQuote 仅一句<=80字。",
-    "- confidence：0~1。",
-    "你可能会得到这些提示：",
+    "你是旅行/探店/本地生活截图助手。必须同时完成「抄录可见文字」与「结构化 POI」，只输出 JSON（无 Markdown）。",
+    "JSON：{ title, city, interests, text, confidence, places[] }；Place={ categoryTags, name, road, district, addressHint, note, rawQuote }。",
+    "【text — 恢复完整抄录，禁止为空】",
+    "- 把图中与店名、地名、地址、路线、菜品、评论正文相关的**可见文字**尽量完整写入 text（保留换行）。",
+    "- 可删纯 UI 套话（点赞/关注/展开全文/直播中），但**不得**因「提炼」而整段留空。",
+    "- 手写便签/清单：逐行列出可见店名或标题行；无空格的长中文行可整行保留。",
+    "【places — 可地图检索的实体】",
+    "- name 必须是店名/景点/乡镇等可搜索实体；「土菜馆、火锅、简餐」等**栏目分类**只能进 categoryTags，不能作 name。",
+    "- 顿号/逗号/换行并列多店名 → 多条 places；清单尽量列全（≤24 条）。",
+    "- 路名写入 road/addressHint；rawQuote 为该店原文一句（≤80 字）。",
+    "- title≤26 字；city 无把握填「未知」；interests 1~4 个。",
     `- cityHint: ${cityHint || "(none)"}`,
     `- interestHint: ${interestHint || "(none)"}`
   ].join("\n");
 
   const userText = [
-    "请阅读整张截图：判断类型（含分类便签清单）→去噪提炼→输出 JSON。",
-    "若为「分类 + 多店名」：每个店名各一条 places；分类进 categoryTags。",
-    "注意：只输出 JSON；text 在提炼的同时须保留清单中的**逐行可见文字**（无空格的长中文行可整行保留），不得整段留空。"
+    "阅读截图：先抄录关键可见文字到 text，再从中抽取 places。",
+    "抖音/小红书评论里的路线（如某高速出口、某镇、某山）也写入 text，并尽量拆成 places。",
+    "只输出 JSON。"
   ].join("\n");
 
   const payload = {
     model,
     stream: false,
-    temperature: 0.28,
+    temperature: 0.22,
     messages: [
       { role: "system", content: system },
       {
