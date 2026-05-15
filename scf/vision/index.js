@@ -94,6 +94,29 @@ function reEscapeForRegex(s) {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+/** 智谱偶发 Markdown 代码块或前后废话，需从 content 中抠出 JSON */
+function safeModelJsonParse(content) {
+  if (typeof content !== "string") return null;
+  let t = content.trim();
+  if (t.startsWith("```")) {
+    t = t.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
+  }
+  const tryOne = (x) => {
+    try {
+      const o = JSON.parse(x);
+      return o && typeof o === "object" ? o : null;
+    } catch {
+      return null;
+    }
+  };
+  let o = tryOne(t);
+  if (o) return o;
+  const a = t.indexOf("{");
+  const b = t.lastIndexOf("}");
+  if (a >= 0 && b > a) return tryOne(t.slice(a, b + 1));
+  return null;
+}
+
 function inferVenueNamesFromGuideBlob(text) {
   if (!text || typeof text !== "string") return [];
   let s = text.slice(0, 6000);
@@ -124,6 +147,18 @@ function inferVenueNamesFromGuideBlob(text) {
     if (seen.has(t)) continue;
     seen.add(t);
     out.push(t);
+  }
+  if (!out.length) {
+    for (const rawLine of text.split(/\r?\n/)) {
+      const u = rawLine.replace(/^\s*\d{1,3}\s*[\.\、．。:：\)）\]]\s*/, "").trim();
+      if (u.length < 2 || u.length > 48) continue;
+      if (PLACE_SECTION_HEADERS.has(u) || GENERIC_NON_POI_NAMES.has(u)) continue;
+      if (/^(未分类|未知|未命名)$/.test(u)) continue;
+      if (seen.has(u)) continue;
+      seen.add(u);
+      out.push(u.slice(0, 80));
+      if (out.length >= 24) break;
+    }
   }
   return out;
 }
@@ -329,7 +364,7 @@ async function handleVision(event) {
     '  "rawQuote": string',
     "}",
     "【提炼与过滤】",
-    "- text：经提炼的正文（去 UI 套话、重复 hashtag、无信息口播），保留对收藏有用的关键句，约 1200 字内。",
+    "- text：**禁止**输出空字符串。手写/备忘录/编号清单必须把图中**可见店名或标题行**逐行写入 text（可轻度去噪），否则无法地图检索；约 1200 字内。",
     "- title：<=26 字，具体主题，避免“截图/抖音”等空泛词。",
     "- city：综合判断；无把握填“未知”。",
     "- interests：1~4 个；无把握 [\"未分类\"]。",
@@ -347,7 +382,7 @@ async function handleVision(event) {
   const userText = [
     "请阅读整张截图：判断类型（含分类便签清单）→去噪提炼→输出 JSON。",
     "若为「分类 + 多店名」：每个店名各一条 places；分类进 categoryTags。",
-    "注意：只输出 JSON；text 为提炼正文，非全文 OCR。"
+    "注意：只输出 JSON；text 在提炼的同时须保留清单中的**逐行可见文字**（无空格的长中文行可整行保留），不得整段留空。"
   ].join("\n");
 
   const payload = {
@@ -395,12 +430,7 @@ async function handleVision(event) {
   if (!upstream.ok) return json(502, { error: "Upstream error", status: upstream.status, details: raw }, event);
 
   const content = raw?.choices?.[0]?.message?.content;
-  let parsed = null;
-  try {
-    parsed = typeof content === "string" ? JSON.parse(content) : null;
-  } catch {
-    parsed = null;
-  }
+  const parsed = safeModelJsonParse(typeof content === "string" ? content : "");
   if (!parsed || typeof parsed !== "object") {
     return json(502, { error: "Model output is not valid JSON", content }, event);
   }

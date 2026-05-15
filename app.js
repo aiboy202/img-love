@@ -503,6 +503,19 @@ function inferVenueNamesFromGuideBlob(text) {
     seen.add(t);
     out.push(t);
   }
+  // 本地 OCR 常为「整行中文无空格」，按行兜底（略宽于 isUsablePoiName 分词）
+  if (!out.length) {
+    for (const rawLine of text.split(/\r?\n/)) {
+      const u = rawLine.replace(/^\s*\d{1,3}\s*[\.\、．。:：\)）\]]\s*/, "").trim();
+      if (u.length < 2 || u.length > 48) continue;
+      if (PLACE_SECTION_HEADERS.has(u) || GENERIC_NON_POI_NAMES.has(u)) continue;
+      if (/^(未分类|未知|未命名)$/.test(u)) continue;
+      if (seen.has(u)) continue;
+      seen.add(u);
+      out.push(u.slice(0, 80));
+      if (out.length >= 24) break;
+    }
+  }
   return out;
 }
 
@@ -1528,6 +1541,7 @@ async function importFiles(files) {
       els.progressBar.style.width = "85%";
 
       text = typeof ai?.text === "string" ? ai.text : "";
+      // 后续若触发本地 OCR 补全，会覆盖 text
     } catch (e) {
       showProgress(false);
       const msg = String(e?.message || e || "未知错误");
@@ -1544,9 +1558,7 @@ async function importFiles(files) {
     let city = "未知";
     let poi = "";
     let address = "";
-    let title = guessTitleFromText(text);
 
-    if (typeof ai?.title === "string" && ai.title.trim()) title = ai.title.trim();
     if (typeof ai?.city === "string" && ai.city.trim()) city = ai.city.trim();
     if (Array.isArray(ai?.interests) && ai.interests.length) interests = ai.interests;
     if (typeof ai?.poi === "string") poi = ai.poi.trim();
@@ -1556,8 +1568,35 @@ async function importFiles(files) {
     if (!city) city = "未知";
 
     const hintCity = state.settings.currentCity && state.settings.currentCity !== "全部" ? state.settings.currentCity : city;
-    const { city: parsedCity, places } = placesFromVisionPayload(ai, hintCity);
+    const workAi = ai && typeof ai === "object" ? { ...ai } : {};
+    let { city: parsedCity, places } = placesFromVisionPayload(workAi, hintCity);
     city = parsedCity || city;
+
+    let kwCity = city;
+    if (!kwCity || kwCity === "未知" || kwCity === "全部") {
+      if (hintCity && hintCity !== "未知" && hintCity !== "全部") kwCity = hintCity;
+    }
+    const visionUselessForSearch =
+      !places.length || places.every((pl) => pl && typeof pl === "object" && !buildPlaceSearchKeyword(kwCity, pl));
+    if (visionUselessForSearch) {
+      try {
+        setProgress("本地 OCR 补全中", idx + 1, list.length);
+        const ocrText = await ocrImage(file, { lang: state.settings.ocrLang || "chi_sim" });
+        const ot = String(ocrText || "").trim();
+        if (ot) {
+          workAi.text = [typeof workAi.text === "string" ? workAi.text : "", ocrText].filter((x) => String(x || "").trim()).join("\n\n");
+          const r2 = placesFromVisionPayload(workAi, hintCity);
+          places = r2.places;
+          if (r2.city && r2.city !== "未知" && r2.city !== "全部") city = r2.city;
+        }
+      } catch (e) {
+        console.warn("本地 OCR 补全失败", e);
+      }
+    }
+
+    text = typeof workAi.text === "string" ? workAi.text : text;
+    const title =
+      typeof ai?.title === "string" && ai.title.trim() ? ai.title.trim() : guessTitleFromText(text);
 
     const primaryInterest =
       (places[0]?.categoryTags?.[0] && places[0].categoryTags[0] !== "未分类" ? places[0].categoryTags[0] : null) ||

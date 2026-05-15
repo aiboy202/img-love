@@ -20,11 +20,25 @@ function serverError(message) {
 }
 
 function safeJsonParse(s) {
-  try {
-    return JSON.parse(s);
-  } catch {
-    return null;
+  if (typeof s !== "string") return null;
+  let t = s.trim();
+  if (t.startsWith("```")) {
+    t = t.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
   }
+  const tryOne = (x) => {
+    try {
+      const o = JSON.parse(x);
+      return o && typeof o === "object" ? o : null;
+    } catch {
+      return null;
+    }
+  };
+  let o = tryOne(t);
+  if (o) return o;
+  const a = t.indexOf("{");
+  const b = t.lastIndexOf("}");
+  if (a >= 0 && b > a) return tryOne(t.slice(a, b + 1));
+  return null;
 }
 
 /** 便签/清单里「土菜馆」等分类词，不作为独立 POI；顿号并列的店名则拆成多条 */
@@ -140,6 +154,18 @@ function inferVenueNamesFromGuideBlob(text) {
     if (seen.has(t)) continue;
     seen.add(t);
     out.push(t);
+  }
+  if (!out.length) {
+    for (const rawLine of text.split(/\r?\n/)) {
+      const u = rawLine.replace(/^\s*\d{1,3}\s*[\.\、．。:：\)）\]]\s*/, "").trim();
+      if (u.length < 2 || u.length > 48) continue;
+      if (PLACE_SECTION_HEADERS.has(u) || GENERIC_NON_POI_NAMES.has(u)) continue;
+      if (/^(未分类|未知|未命名)$/.test(u)) continue;
+      if (seen.has(u)) continue;
+      seen.add(u);
+      out.push(u.slice(0, 80));
+      if (out.length >= 24) break;
+    }
   }
   return out;
 }
@@ -330,7 +356,7 @@ export default async function onRequest(context) {
     '  "rawQuote": string',
     "}",
     "【提炼与过滤（重要）】",
-    "- text：写**经提炼的正文**，不是把界面上的字逐行照抄。去掉：无意义的 UI 文案（如“点赞收藏”“关注”“展开全文”“点击查看更多”“直播中”等）、重复堆叠的 hashtag、纯表情、与地点/攻略无关的口播套话；保留：店名/景点名、地址片段、价格人均、排队/预约提示、营业时间、推荐理由、路线关键句等**对收藏与检索有用**的信息。可换行，控制在约 1200 字以内（超出可截断）。",
+    "- text：**禁止**输出空字符串。经提炼的同时，若为手写/备忘录/编号清单，必须把图中**可见店名或标题行**逐行写入 text（可去 UI 套话与无关 hashtag）；无空格的长中文行可整行保留一行。其余类型仍去掉无意义 UI 文案，保留店名/地址/人均/营业时间等对检索有用的信息；约 1200 字内。",
     "- title：<=26 字，用**具体主题**概括（例如“杭州某店｜排队与必点”），不要用“截图”“抖音”等空泛词。",
     "- city：从正文/定位条/话题/地图信息综合判断；无把握填“未知”。若与 cityHint 冲突，以截图证据为准。",
     "- interests：全文层面 1~4 个兴趣标签；与 categoryTags 可重叠；无把握用 [\"未分类\"]。",
@@ -356,7 +382,7 @@ export default async function onRequest(context) {
   const userText = [
     "请阅读整张截图：先判断内容类型（探店/攻略/地图/纯文字/分类便签清单），再做去噪与信息提炼，最后按 JSON 结构输出。",
     "若为「分类标题 + 多店名」清单：每个店名各一条 places；分类进 categoryTags；并列店名勿合并成一条。",
-    "注意：只输出 JSON；text 必须是提炼后的正文，不是原始 OCR 全文。"
+    "注意：只输出 JSON；text 须含对检索有用的可见文字，**不得整段为空**；提炼与「逐行列出清单文字」可同时满足。"
   ].join("\n");
 
   const payload = {

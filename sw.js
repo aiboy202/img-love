@@ -1,4 +1,4 @@
-const CACHE_NAME = "img-love-v17-vision-expand";
+const CACHE_NAME = "img-love-v18-ocr-fallback";
 const APP_SHELL = [
   "/",
   "/index.html",
