@@ -132,6 +132,36 @@ async function sampleKvKeyNames(kv, maxKeys) {
   return names.slice(0, cap);
 }
 
+/** probe：不返回值，只判断 KV 里常见键是否存在 + list 是否正常 */
+async function probeKvBinding(kv) {
+  const out = {};
+  if (!kv || typeof kv.get !== "function") {
+    out.kvBindingGetMissing = true;
+    return out;
+  }
+  try {
+    const bm = await kv.get("BIGMODEL_API_KEY");
+    const bm2 = await kv.get("bigmodel_api_key");
+    out.bigmodelKeyPresentInKv = Boolean(
+      (typeof bm === "string" && normalizeSecretString(bm)) || (typeof bm2 === "string" && normalizeSecretString(bm2))
+    );
+    const ak = await kv.get("AMAP_REST_KEY");
+    out.amapRestKeyPresentDirectGet = typeof ak === "string" && Boolean(normalizeSecretString(ak));
+
+    if (typeof kv.list === "function") {
+      const page = await kv.list({ limit: 30 });
+      out.kvListFirstPageCount = Array.isArray(page?.keys) ? page.keys.length : -1;
+      out.kvListComplete = Boolean(page?.list_complete);
+      out.kvListHasMore = Boolean(page?.cursor);
+    } else {
+      out.kvListUnsupported = true;
+    }
+  } catch (e) {
+    out.kvProbeError = String(e?.message || e);
+  }
+  return out;
+}
+
 async function readAmapKey(env) {
   const fromEnv =
     normalizeSecretString(typeof env?.AMAP_REST_KEY === "string" ? env.AMAP_REST_KEY : "") ||
@@ -274,7 +304,28 @@ export default async function onRequest(context) {
       const k = await readAmapKey(env);
       let kvKeyNamesSample = [];
       let kvListError = null;
+      let bindingProbe = null;
       if (!k && kvs.length) {
+        bindingProbe = {
+          bigmodelInEnv: Boolean(normalizeSecretString(typeof env?.BIGMODEL_API_KEY === "string" ? env.BIGMODEL_API_KEY : "")),
+          amapInEnv: Boolean(normalizeSecretString(typeof env?.AMAP_REST_KEY === "string" ? env.AMAP_REST_KEY : "")),
+          kvNamespacesProbed: kvs.length,
+          bigmodelKeyPresentInAnyKv: false,
+          amapRestKeyPresentDirectGetInAnyKv: false,
+          kvListFirstPageCountMax: -1,
+          kvListUnsupportedEverywhere: true
+        };
+        for (const kv of kvs) {
+          const p = await probeKvBinding(kv);
+          if (p.bigmodelKeyPresentInKv) bindingProbe.bigmodelKeyPresentInAnyKv = true;
+          if (p.amapRestKeyPresentDirectGet) bindingProbe.amapRestKeyPresentDirectGetInAnyKv = true;
+          if (typeof p.kvListFirstPageCount === "number" && p.kvListFirstPageCount >= 0) {
+            bindingProbe.kvListFirstPageCountMax = Math.max(bindingProbe.kvListFirstPageCountMax, p.kvListFirstPageCount);
+          }
+          if (!p.kvListUnsupported) bindingProbe.kvListUnsupportedEverywhere = false;
+          if (p.kvProbeError && !bindingProbe.kvProbeError) bindingProbe.kvProbeError = p.kvProbeError;
+          if (p.kvBindingGetMissing) bindingProbe.someKvBindingInvalid = true;
+        }
         try {
           const seen = new Set();
           for (const kv of kvs) {
@@ -291,6 +342,22 @@ export default async function onRequest(context) {
           kvListError = String(e?.message || e);
         }
       }
+      let fixHint =
+        "未在 KV 中读到高德 Key。请在当前 Worker 已绑定的 KV 命名空间里新增键名 **AMAP_REST_KEY**（值=高德开放平台「Web服务」Key，不要引号、不要换行）。也可在 Pages/Worker「环境变量」里直接添加 AMAP_REST_KEY（不必经 KV）。";
+      if (!k && bindingProbe) {
+        if (bindingProbe.bigmodelInEnv && !bindingProbe.bigmodelKeyPresentInAnyKv && bindingProbe.kvListFirstPageCountMax === 0) {
+          fixHint +=
+            " 当前探测：BIGMODEL_API_KEY 在环境变量、所有已绑定 KV 的 list 首屏键数均为 0——该 KV 很可能**从未写入**，或写在了**控制台里另一个 KV 命名空间**（与 Worker 绑定的不一致）。请在 Workers/Pages → 本项目的 KV 绑定里点开**同一 ID** 的命名空间核对。";
+        }
+        if (bindingProbe.bigmodelKeyPresentInAnyKv && bindingProbe.kvListFirstPageCountMax === 0 && !bindingProbe.kvListUnsupportedEverywhere) {
+          fixHint +=
+            " 当前探测：KV.get 能读到 BIGMODEL_API_KEY，但 list 首屏键数为 0（少见）；仍请在控制台核对并新增 AMAP_REST_KEY。";
+        }
+        if (bindingProbe.amapRestKeyPresentDirectGetInAnyKv) {
+          fixHint =
+            "探测到某命名空间内 AMAP_REST_KEY 可读，但聚合读取未成功（不应发生）；请重新部署最新 amap.js 或反馈。";
+        }
+      }
       probe = {
         amapKeyLoaded: Boolean(k),
         amapKeyCharLength: k ? k.length : 0,
@@ -298,12 +365,12 @@ export default async function onRequest(context) {
         envHasAMAP_REST_KEY: Boolean(normalizeSecretString(typeof env?.AMAP_REST_KEY === "string" ? env.AMAP_REST_KEY : "")),
         ...(!k
           ? {
-              fixHint:
-                "未在 KV 中读到高德 Key。请在当前 Worker 已绑定的 KV 命名空间里新增键名 **AMAP_REST_KEY**（值=高德开放平台「Web服务」Key，不要引号、不要换行）。若你用了别的键名，可把该键改名为 AMAP_REST_KEY，或把下方列出的键名发给我们扩展读取列表。",
+              fixHint,
               triedKeyNames:
                 "AMAP_REST_KEY, AMAP_KEY, AMAP_WEB_SERVICE_KEY, GAODE_KEY, amap_key 等（代码内已做多组变体尝试）"
             }
           : {}),
+        ...(!k && bindingProbe ? { bindingProbe } : {}),
         ...(!k && kvs.length ? { kvKeyNamesSample } : {}),
         ...(kvListError ? { kvListError } : {})
       };
